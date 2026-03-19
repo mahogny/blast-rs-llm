@@ -9,7 +9,8 @@ use blast_db::index::SeqType;
 use blast_core::{
     SearchParams,
     matrix::MatrixType,
-    search::{blast_search, blastn_search},
+    search::{blast_search, blastn_search, blastx_search, tblastn_search, tblastx_search},
+    pssm::psiblast_search,
 };
 
 #[derive(Parser)]
@@ -25,6 +26,14 @@ enum Commands {
     Blastp(BlastArgs),
     /// Nucleotide-nucleotide BLAST search
     Blastn(BlastArgs),
+    /// Translate nucleotide query, search protein database
+    Blastx(BlastArgs),
+    /// Protein query against translated nucleotide database
+    Tblastn(BlastArgs),
+    /// Translated nucleotide query vs translated nucleotide database
+    Tblastx(BlastArgs),
+    /// Iterative protein search using position-specific scoring matrix (PSI-BLAST)
+    Psiblast(PsiblastArgs),
     /// Dump sequences from a BLAST database (for testing)
     Dumpdb(DumpArgs),
     /// Build a BLAST database from a FASTA file
@@ -67,12 +76,18 @@ struct BlastArgs {
     /// Number of threads (0 = all available)
     #[arg(long = "num_threads", default_value = "0")]
     num_threads: usize,
-    /// Match score (blastn only)
+    /// Match score (blastn/blastx/tblastn only)
     #[arg(long = "reward", default_value = "2")]
     match_score: i32,
     /// Mismatch penalty (blastn only, positive value will be negated)
     #[arg(long = "penalty", default_value = "-3")]
     mismatch: i32,
+    /// Disable low-complexity (SEG/DUST) filtering
+    #[arg(long = "no-lc-filter")]
+    no_lc_filter: bool,
+    /// Disable composition-based statistics adjustment
+    #[arg(long = "no-comp-adjust")]
+    no_comp_adjust: bool,
 }
 
 #[derive(clap::Args)]
@@ -95,6 +110,46 @@ struct DumpArgs {
     /// Show v5 volume info from LMDB
     #[arg(long)]
     volumes: bool,
+}
+
+#[derive(clap::Args)]
+struct PsiblastArgs {
+    /// Query FASTA file (protein)
+    #[arg(short = 'q', long)]
+    query: PathBuf,
+    /// Database path (without extension)
+    #[arg(short, long)]
+    db: PathBuf,
+    /// Output file (default: stdout)
+    #[arg(short, long)]
+    out: Option<PathBuf>,
+    /// E-value threshold for reporting hits
+    #[arg(long, default_value = "10")]
+    evalue: f64,
+    /// E-value threshold for including hits in PSSM construction
+    #[arg(long, default_value = "0.001")]
+    inclusion_ethresh: f64,
+    /// Number of PSI-BLAST iterations
+    #[arg(long = "num_iterations", default_value = "3")]
+    num_iterations: u32,
+    /// Output format
+    #[arg(long = "outfmt", default_value = "0")]
+    outfmt: String,
+    /// Maximum target sequences
+    #[arg(long, default_value = "500")]
+    max_target_seqs: usize,
+    /// Scoring matrix
+    #[arg(long, default_value = "BLOSUM62")]
+    matrix: String,
+    /// Gap open penalty
+    #[arg(long = "gapopen")]
+    gap_open: Option<i32>,
+    /// Gap extend penalty
+    #[arg(long = "gapextend")]
+    gap_extend: Option<i32>,
+    /// Number of threads (0 = all)
+    #[arg(long = "num_threads", default_value = "0")]
+    num_threads: usize,
 }
 
 #[derive(clap::Args)]
@@ -121,6 +176,10 @@ fn main() {
     match &cli.command {
         Commands::Blastp(args)      => run_blastp(args),
         Commands::Blastn(args)      => run_blastn(args),
+        Commands::Blastx(args)      => run_blastx(args),
+        Commands::Tblastn(args)     => run_tblastn(args),
+        Commands::Tblastx(args)     => run_tblastx(args),
+        Commands::Psiblast(args)    => run_psiblast(args),
         Commands::Dumpdb(args)      => run_dumpdb(args),
         Commands::Makeblastdb(args) => run_makeblastdb(args),
     }
@@ -153,6 +212,8 @@ fn run_blastp(args: &BlastArgs) {
     params.matrix = matrix;
     params.evalue_threshold = args.evalue;
     params.max_target_seqs = args.max_target_seqs;
+    params.filter_low_complexity = !args.no_lc_filter;
+    params.comp_adjust = !args.no_comp_adjust;
     if let Some(go) = args.gap_open { params.gap_open = go; }
     if let Some(ge) = args.gap_extend { params.gap_extend = ge; }
     if let Some(ws) = args.word_size { params.word_size = ws; }
@@ -233,6 +294,8 @@ fn run_blastn(args: &BlastArgs) {
     params.max_target_seqs = args.max_target_seqs;
     params.match_score = args.match_score;
     params.mismatch = args.mismatch;
+    params.filter_low_complexity = !args.no_lc_filter;
+    params.comp_adjust = !args.no_comp_adjust;
     if let Some(go) = args.gap_open { params.gap_open = go; }
     if let Some(ge) = args.gap_extend { params.gap_extend = ge; }
     if let Some(ws) = args.word_size { params.word_size = ws; }
@@ -286,6 +349,231 @@ fn run_blastn(args: &BlastArgs) {
     } else if fmt.fmt_id == 15 {
         output::write_json_footer(&mut out).unwrap();
     }
+}
+
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
+fn make_output(args_out: &Option<PathBuf>) -> io::BufWriter<Box<dyn Write>> {
+    let out: Box<dyn Write> = match args_out {
+        Some(p) => Box::new(fs::File::create(p).unwrap()),
+        None    => Box::new(io::stdout()),
+    };
+    io::BufWriter::new(out)
+}
+
+fn parse_fmt(outfmt: &str) -> output::OutputFormat {
+    output::OutputFormat::parse(outfmt).unwrap_or_else(|e| {
+        eprintln!("Error parsing --outfmt: {}", e);
+        std::process::exit(1);
+    })
+}
+
+fn parse_matrix(matrix: &str) -> MatrixType {
+    matrix.parse().unwrap_or_else(|e: String| {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    })
+}
+
+fn open_db(db: &PathBuf) -> BlastDb {
+    BlastDb::open(db).unwrap_or_else(|e| {
+        eprintln!("Error opening database: {}", e);
+        std::process::exit(1);
+    })
+}
+
+fn set_threads(n: usize) {
+    if n > 0 {
+        rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
+    }
+}
+
+// ── BLASTX ───────────────────────────────────────────────────────────────────
+
+fn run_blastx(args: &BlastArgs) {
+    let db = open_db(&args.db);
+    set_threads(args.num_threads);
+
+    let fmt = parse_fmt(&args.outfmt);
+    let mut params = SearchParams::blastx_defaults();
+    params.evalue_threshold = args.evalue;
+    params.max_target_seqs = args.max_target_seqs;
+    params.filter_low_complexity = !args.no_lc_filter;
+    params.comp_adjust = !args.no_comp_adjust;
+    if let Some(go) = args.gap_open  { params.gap_open = go; }
+    if let Some(ge) = args.gap_extend { params.gap_extend = ge; }
+    if let Some(ws) = args.word_size  { params.word_size = ws; }
+
+    let queries = read_fasta(&args.query).unwrap_or_else(|e| {
+        eprintln!("Error reading query: {}", e);
+        std::process::exit(1);
+    });
+
+    let mut out = make_output(&args.out);
+    let db_path  = args.db.to_string_lossy();
+    let db_title = db.title().to_string();
+    let db_num_seqs = db.num_sequences() as u64;
+    let db_len   = db.volume_length();
+
+    if fmt.fmt_id == 5 { output::write_xml_header(&mut out, "blastx", &db_path, "blast-cli 0.1.0").unwrap(); }
+    else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
+
+    for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
+        let results = blastx_search(&db, query_seq, &params);
+        let ctx = output::SearchContext {
+            program: "blastx", db_path: &db_path, db_title: &db_title,
+            db_num_seqs, db_len, query_title,
+            query_seq, query_len: query_seq.len(),
+            matrix: "N/A", gap_open: params.gap_open, gap_extend: params.gap_extend,
+            evalue_threshold: args.evalue, iter_num: iter_num + 1,
+        };
+        output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
+    }
+
+    if fmt.fmt_id == 5 { output::write_xml_footer(&mut out).unwrap(); }
+    else if fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
+}
+
+// ── TBLASTN ──────────────────────────────────────────────────────────────────
+
+fn run_tblastn(args: &BlastArgs) {
+    let db = open_db(&args.db);
+    set_threads(args.num_threads);
+
+    let matrix = parse_matrix(&args.matrix);
+    let fmt = parse_fmt(&args.outfmt);
+    let mut params = SearchParams::tblastn_defaults();
+    params.matrix = matrix;
+    params.evalue_threshold = args.evalue;
+    params.max_target_seqs = args.max_target_seqs;
+    params.filter_low_complexity = !args.no_lc_filter;
+    params.comp_adjust = !args.no_comp_adjust;
+    if let Some(go) = args.gap_open   { params.gap_open = go; }
+    if let Some(ge) = args.gap_extend { params.gap_extend = ge; }
+    if let Some(ws) = args.word_size  { params.word_size = ws; }
+
+    let queries = read_fasta(&args.query).unwrap_or_else(|e| {
+        eprintln!("Error reading query: {}", e);
+        std::process::exit(1);
+    });
+
+    let mut out = make_output(&args.out);
+    let db_path     = args.db.to_string_lossy();
+    let db_title    = db.title().to_string();
+    let db_num_seqs = db.num_sequences() as u64;
+    let db_len      = db.volume_length();
+    let matrix_name = args.matrix.as_str();
+
+    if fmt.fmt_id == 5 { output::write_xml_header(&mut out, "tblastn", &db_path, "blast-cli 0.1.0").unwrap(); }
+    else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
+
+    for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
+        let results = tblastn_search(&db, query_seq, &params);
+        let ctx = output::SearchContext {
+            program: "tblastn", db_path: &db_path, db_title: &db_title,
+            db_num_seqs, db_len, query_title,
+            query_seq, query_len: query_seq.len(),
+            matrix: matrix_name, gap_open: params.gap_open, gap_extend: params.gap_extend,
+            evalue_threshold: args.evalue, iter_num: iter_num + 1,
+        };
+        output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
+    }
+
+    if fmt.fmt_id == 5 { output::write_xml_footer(&mut out).unwrap(); }
+    else if fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
+}
+
+// ── TBLASTX ──────────────────────────────────────────────────────────────────
+
+fn run_tblastx(args: &BlastArgs) {
+    let db = open_db(&args.db);
+    set_threads(args.num_threads);
+
+    let fmt = parse_fmt(&args.outfmt);
+    let mut params = SearchParams::tblastx_defaults();
+    params.evalue_threshold = args.evalue;
+    params.max_target_seqs = args.max_target_seqs;
+    params.filter_low_complexity = !args.no_lc_filter;
+    params.comp_adjust = !args.no_comp_adjust;
+    if let Some(ws) = args.word_size { params.word_size = ws; }
+
+    let queries = read_fasta(&args.query).unwrap_or_else(|e| {
+        eprintln!("Error reading query: {}", e);
+        std::process::exit(1);
+    });
+
+    let mut out = make_output(&args.out);
+    let db_path     = args.db.to_string_lossy();
+    let db_title    = db.title().to_string();
+    let db_num_seqs = db.num_sequences() as u64;
+    let db_len      = db.volume_length();
+
+    if fmt.fmt_id == 5 { output::write_xml_header(&mut out, "tblastx", &db_path, "blast-cli 0.1.0").unwrap(); }
+    else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
+
+    for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
+        let results = tblastx_search(&db, query_seq, &params);
+        let ctx = output::SearchContext {
+            program: "tblastx", db_path: &db_path, db_title: &db_title,
+            db_num_seqs, db_len, query_title,
+            query_seq, query_len: query_seq.len(),
+            matrix: "N/A", gap_open: params.gap_open, gap_extend: params.gap_extend,
+            evalue_threshold: args.evalue, iter_num: iter_num + 1,
+        };
+        output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
+    }
+
+    if fmt.fmt_id == 5 { output::write_xml_footer(&mut out).unwrap(); }
+    else if fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
+}
+
+// ── PSI-BLAST ────────────────────────────────────────────────────────────────
+
+fn run_psiblast(args: &PsiblastArgs) {
+    let db = open_db(&args.db);
+    set_threads(args.num_threads);
+
+    let matrix = parse_matrix(&args.matrix);
+    let fmt = parse_fmt(&args.outfmt);
+    let mut params = SearchParams::blastp_defaults();
+    params.matrix = matrix;
+    params.evalue_threshold = args.evalue;
+    params.max_target_seqs = args.max_target_seqs;
+    if let Some(go) = args.gap_open   { params.gap_open = go; }
+    if let Some(ge) = args.gap_extend { params.gap_extend = ge; }
+
+    let queries = read_fasta(&args.query).unwrap_or_else(|e| {
+        eprintln!("Error reading query: {}", e);
+        std::process::exit(1);
+    });
+
+    let mut out = make_output(&args.out);
+    let db_path     = args.db.to_string_lossy();
+    let db_title    = db.title().to_string();
+    let db_num_seqs = db.num_sequences() as u64;
+    let db_len      = db.volume_length();
+    let matrix_name = args.matrix.as_str();
+
+    if fmt.fmt_id == 5 { output::write_xml_header(&mut out, "psiblast", &db_path, "blast-cli 0.1.0").unwrap(); }
+    else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
+
+    for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
+        let query_ncbi = aa_to_ncbistdaa(query_seq);
+        let (results, _pssm) = psiblast_search(
+            &db, &query_ncbi, &params, args.num_iterations, args.inclusion_ethresh,
+        );
+        let ctx = output::SearchContext {
+            program: "psiblast", db_path: &db_path, db_title: &db_title,
+            db_num_seqs, db_len, query_title,
+            query_seq, query_len: query_seq.len(),
+            matrix: matrix_name, gap_open: params.gap_open, gap_extend: params.gap_extend,
+            evalue_threshold: args.evalue, iter_num: iter_num + 1,
+        };
+        output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
+    }
+
+    if fmt.fmt_id == 5 { output::write_xml_footer(&mut out).unwrap(); }
+    else if fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
 }
 
 fn run_makeblastdb(args: &MakeDbArgs) {

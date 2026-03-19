@@ -19,6 +19,14 @@ pub struct Hsp {
     pub midline: Vec<u8>,
     /// Subject alignment string (with gaps)
     pub subject_aln: Vec<u8>,
+    /// Reading frame of the query translation.
+    /// +1/+2/+3 for forward strand, -1/-2/-3 for reverse complement.
+    /// 0 for blastp/blastn (no translation).
+    pub query_frame: i32,
+    /// Reading frame of the subject translation.
+    /// +1/+2/+3 for forward strand, -1/-2/-3 for reverse complement.
+    /// 0 for blastp/blastn (no translation).
+    pub subject_frame: i32,
 }
 
 impl Hsp {

@@ -6,8 +6,16 @@ pub mod extend;
 pub mod align;
 pub mod search;
 pub mod hsp;
+pub mod translate;
+pub mod mask;
+pub mod pssm;
+pub mod compo;
 
 pub use matrix::{ScoringMatrix, MatrixType};
 pub use stats::KarlinAltschul;
 pub use hsp::{Hsp, SearchResult};
 pub use search::{SearchParams, blast_search};
+pub use translate::{six_frame_translate, reverse_complement, TranslatedFrame};
+pub use mask::{apply_dust, apply_seg, apply_seg_ncbistdaa};
+pub use pssm::{Pssm, build_pssm, psiblast_search, search_with_pssm};
+pub use compo::{composition_ncbistdaa, adjust_evalue, BACKGROUND_FREQ};
