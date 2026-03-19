@@ -1,10 +1,12 @@
+mod output;
+
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::io::{self, BufRead, Write};
 use clap::{Parser, Subcommand};
 use blast_db::BlastDb;
 use blast_core::{
-    SearchParams, SearchResult, Hsp,
+    SearchParams,
     matrix::MatrixType,
     search::{blast_search, blastn_search},
 };
@@ -40,9 +42,10 @@ struct BlastArgs {
     /// E-value threshold
     #[arg(long, default_value = "10")]
     evalue: f64,
-    /// Output format: 0=pairwise, 6=tabular
+    /// Output format: 0=pairwise, 5=XML, 6=tabular, 7=tabular+comments, 10=CSV, 15=JSON, 16=XML2, 17=FASTA, etc.
+    /// For tabular formats, columns can be specified: e.g. "6 qseqid sseqid pident evalue"
     #[arg(long = "outfmt", default_value = "0")]
-    outfmt: u32,
+    outfmt: String,
     /// Maximum target sequences
     #[arg(long, default_value = "500")]
     max_target_seqs: usize,
@@ -118,6 +121,11 @@ fn run_blastp(args: &BlastArgs) {
         std::process::exit(1);
     });
 
+    let fmt = output::OutputFormat::parse(&args.outfmt).unwrap_or_else(|e| {
+        eprintln!("Error parsing --outfmt: {}", e);
+        std::process::exit(1);
+    });
+
     let mut params = SearchParams::blastp_defaults();
     params.matrix = matrix;
     params.evalue_threshold = args.evalue;
@@ -137,15 +145,45 @@ fn run_blastp(args: &BlastArgs) {
     };
     let mut out = io::BufWriter::new(out);
 
-    for (query_title, query_seq) in &queries {
-        // Convert ASCII amino acids to Ncbistdaa
+    let db_path = args.db.to_string_lossy();
+    let db_title = db.title().to_string();
+    let db_num_seqs = db.num_sequences() as u64;
+    let db_len = db.volume_length();
+    let matrix_name = args.matrix.as_str();
+
+    if fmt.fmt_id == 5 {
+        output::write_xml_header(&mut out, "blastp", &db_path, "blast-cli 0.1.0").unwrap();
+    } else if fmt.fmt_id == 15 {
+        output::write_json_header(&mut out).unwrap();
+    }
+
+    for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
         let query_ncbistdaa = aa_to_ncbistdaa(query_seq);
         let results = blast_search(&db, &query_ncbistdaa, &params);
 
-        match args.outfmt {
-            6 => write_tabular(&mut out, query_title, &results),
-            _ => write_pairwise(&mut out, query_title, query_seq, &results, &db),
-        }
+        let ctx = output::SearchContext {
+            program: "blastp",
+            db_path: &db_path,
+            db_title: &db_title,
+            db_num_seqs,
+            db_len,
+            query_title,
+            query_seq,
+            query_len: query_seq.len(),
+            matrix: matrix_name,
+            gap_open: params.gap_open,
+            gap_extend: params.gap_extend,
+            evalue_threshold: args.evalue,
+            iter_num: iter_num + 1,
+        };
+
+        output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
+    }
+
+    if fmt.fmt_id == 5 {
+        output::write_xml_footer(&mut out).unwrap();
+    } else if fmt.fmt_id == 15 {
+        output::write_json_footer(&mut out).unwrap();
     }
 }
 
@@ -161,6 +199,11 @@ fn run_blastn(args: &BlastArgs) {
             .build_global()
             .ok();
     }
+
+    let fmt = output::OutputFormat::parse(&args.outfmt).unwrap_or_else(|e| {
+        eprintln!("Error parsing --outfmt: {}", e);
+        std::process::exit(1);
+    });
 
     let mut params = SearchParams::blastn_defaults();
     params.evalue_threshold = args.evalue;
@@ -182,13 +225,43 @@ fn run_blastn(args: &BlastArgs) {
     };
     let mut out = io::BufWriter::new(out);
 
-    for (query_title, query_seq) in &queries {
+    let db_path = args.db.to_string_lossy();
+    let db_title = db.title().to_string();
+    let db_num_seqs = db.num_sequences() as u64;
+    let db_len = db.volume_length();
+
+    if fmt.fmt_id == 5 {
+        output::write_xml_header(&mut out, "blastn", &db_path, "blast-cli 0.1.0").unwrap();
+    } else if fmt.fmt_id == 15 {
+        output::write_json_header(&mut out).unwrap();
+    }
+
+    for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
         let results = blastn_search(&db, query_seq, &params);
 
-        match args.outfmt {
-            6 => write_tabular(&mut out, query_title, &results),
-            _ => write_pairwise(&mut out, query_title, query_seq, &results, &db),
-        }
+        let ctx = output::SearchContext {
+            program: "blastn",
+            db_path: &db_path,
+            db_title: &db_title,
+            db_num_seqs,
+            db_len,
+            query_title,
+            query_seq,
+            query_len: query_seq.len(),
+            matrix: "N/A",
+            gap_open: params.gap_open,
+            gap_extend: params.gap_extend,
+            evalue_threshold: args.evalue,
+            iter_num: iter_num + 1,
+        };
+
+        output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
+    }
+
+    if fmt.fmt_id == 5 {
+        output::write_xml_footer(&mut out).unwrap();
+    } else if fmt.fmt_id == 15 {
+        output::write_json_footer(&mut out).unwrap();
     }
 }
 
@@ -285,151 +358,6 @@ fn run_dumpdb(args: &DumpArgs) {
                 for chunk in seq.chunks(60) {
                     writeln!(out, "{}", std::str::from_utf8(chunk).unwrap_or("?")).unwrap();
                 }
-            }
-        }
-    }
-}
-
-// ---- Output formatters ----
-
-fn write_tabular(out: &mut impl Write, query_title: &str, results: &[SearchResult]) {
-    // Standard 12-column tabular (outfmt 6)
-    // qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore
-    for r in results {
-        for hsp in &r.hsps {
-            let qid = query_title.split_whitespace().next().unwrap_or(query_title);
-            let sid = if !r.subject_accession.is_empty() { &r.subject_accession } else { &r.subject_title };
-            let pident = hsp.percent_identity();
-            let length = hsp.alignment_length;
-            let mismatches = length - hsp.num_identities - hsp.num_gaps;
-            let gapopen = count_gap_opens(&hsp.query_aln) + count_gap_opens(&hsp.subject_aln);
-            writeln!(
-                out,
-                "{}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2e}\t{:.1}",
-                qid,
-                sid,
-                pident,
-                length,
-                mismatches,
-                gapopen,
-                hsp.query_start + 1,  // 1-based
-                hsp.query_end,
-                hsp.subject_start + 1,
-                hsp.subject_end,
-                hsp.evalue,
-                hsp.bit_score,
-            ).unwrap();
-        }
-    }
-}
-
-fn count_gap_opens(aln: &[u8]) -> usize {
-    let mut opens = 0usize;
-    let mut in_gap = false;
-    for &b in aln {
-        if b == b'-' {
-            if !in_gap {
-                opens += 1;
-                in_gap = true;
-            }
-        } else {
-            in_gap = false;
-        }
-    }
-    opens
-}
-
-fn write_pairwise(
-    out: &mut impl Write,
-    query_title: &str,
-    _query_seq: &[u8],
-    results: &[SearchResult],
-    _db: &BlastDb,
-) {
-    writeln!(out, "Query: {}", query_title).unwrap();
-    writeln!(out, "").unwrap();
-
-    if results.is_empty() {
-        writeln!(out, "***** No significant similarity found. *****").unwrap();
-        writeln!(out, "").unwrap();
-        return;
-    }
-
-    // Summary section
-    writeln!(out, "Sequences producing significant alignments:").unwrap();
-    writeln!(out, "").unwrap();
-    for r in results {
-        let title = if !r.subject_accession.is_empty() {
-            format!("{} {}", r.subject_accession, r.subject_title)
-        } else {
-            r.subject_title.clone()
-        };
-        let best_hsp = &r.hsps[0];
-        writeln!(
-            out,
-            "{:<60}  {:.1}  {:.2e}",
-            &title[..title.len().min(60)],
-            best_hsp.bit_score,
-            best_hsp.evalue
-        ).unwrap();
-    }
-    writeln!(out, "").unwrap();
-
-    // Alignment section
-    for r in results {
-        let title = if !r.subject_accession.is_empty() {
-            format!("{} {}", r.subject_accession, r.subject_title)
-        } else {
-            r.subject_title.clone()
-        };
-        writeln!(out, "> {}", title).unwrap();
-        writeln!(out, "   Length = {}", r.subject_len).unwrap();
-        writeln!(out, "").unwrap();
-
-        for hsp in &r.hsps {
-            writeln!(out, " Score = {:.1} bits ({}),  Expect = {:.2e}",
-                hsp.bit_score, hsp.score, hsp.evalue).unwrap();
-            writeln!(out, " Identities = {}/{} ({:.0}%), Gaps = {}/{}",
-                hsp.num_identities,
-                hsp.alignment_length,
-                hsp.percent_identity(),
-                hsp.num_gaps,
-                hsp.alignment_length,
-            ).unwrap();
-            writeln!(out, "").unwrap();
-
-            // Print alignment in 60-char blocks
-            let aln_len = hsp.query_aln.len();
-            let mut pos = 0;
-            let mut q_pos = hsp.query_start;
-            let mut s_pos = hsp.subject_start;
-            while pos < aln_len {
-                let end = (pos + 60).min(aln_len);
-                let q_chunk = &hsp.query_aln[pos..end];
-                let m_chunk = &hsp.midline[pos..end];
-                let s_chunk = &hsp.subject_aln[pos..end];
-
-                let q_chars: usize = q_chunk.iter().filter(|&&b| b != b'-').count();
-                let s_chars: usize = s_chunk.iter().filter(|&&b| b != b'-').count();
-
-                writeln!(out, "Query  {:>5}  {}  {}",
-                    q_pos + 1,
-                    std::str::from_utf8(q_chunk).unwrap_or("?"),
-                    q_pos + q_chars,
-                ).unwrap();
-                writeln!(out, "             {}",
-                    std::str::from_utf8(m_chunk).unwrap_or("?"),
-                ).unwrap();
-                writeln!(out, "Sbjct  {:>5}  {}  {}",
-                    s_pos + 1,
-                    std::str::from_utf8(s_chunk).unwrap_or("?"),
-                    s_pos + s_chars,
-                ).unwrap();
-                writeln!(out, "").unwrap();
-
-                q_pos += q_chars;
-                s_pos += s_chars;
-                pos = end;
             }
         }
     }
