@@ -29,7 +29,7 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
     seq.iter().rev().map(|&c| complement_ascii(c)).collect()
 }
 
-/// Standard genetic code indexed by 2-bit codon: A=0, C=1, G=2, T=3.
+/// Standard genetic code (code 1) indexed by 2-bit codon: A=0, C=1, G=2, T=3.
 /// index = b1*16 + b2*4 + b3.
 ///
 /// ```text
@@ -58,7 +58,180 @@ static CODON_TABLE: [u8; 64] = [
     b'L', b'F', b'L', b'F',  // TT{A,C,G,T}
 ];
 
-/// Translate a single codon from 2-bit encoded bases.
+// ---------------------------------------------------------------------------
+// NCBI genetic code tables (1-33)
+// ---------------------------------------------------------------------------
+//
+// All tables are derived from the standard code (code 1) by applying the
+// documented codon reassignments from NCBI.
+//
+// Codon index: b1*16 + b2*4 + b3 where A=0 C=1 G=2 T=3.
+// Key indices:
+//   AAA=0   AGA=8   AGG=10  ATA=12
+//   CTN=28..31  CTG=30
+//   TAA=48  TAG=50  TCA=52  TGA=56  TTA=60
+
+/// Helper: build a codon table by starting from standard code and applying changes.
+const fn make_table(changes: &[(usize, u8)]) -> [u8; 64] {
+    let mut t = CODON_TABLE;
+    let mut i = 0;
+    while i < changes.len() {
+        t[changes[i].0] = changes[i].1;
+        i += 1;
+    }
+    t
+}
+
+/// Code 2: Vertebrate Mitochondrial
+/// AGA=* AGG=* ATA=M TGA=W
+static CODON_TABLE_2: [u8; 64] = make_table(&[
+    (8, b'*'), (10, b'*'), (12, b'M'), (56, b'W'),
+]);
+
+/// Code 3: Yeast Mitochondrial
+/// ATA=M CTN=T (28..31) TGA=W
+static CODON_TABLE_3: [u8; 64] = make_table(&[
+    (12, b'M'), (28, b'T'), (29, b'T'), (30, b'T'), (31, b'T'), (56, b'W'),
+]);
+
+/// Code 4: Mold, Protozoan, Coelenterate Mitochondrial
+/// TGA=W
+static CODON_TABLE_4: [u8; 64] = make_table(&[(56, b'W')]);
+
+/// Code 5: Invertebrate Mitochondrial
+/// AGA=S AGG=S ATA=M TGA=W
+static CODON_TABLE_5: [u8; 64] = make_table(&[
+    (8, b'S'), (10, b'S'), (12, b'M'), (56, b'W'),
+]);
+
+/// Code 6: Ciliate, Dasycladacean, Hexamita Nuclear
+/// TAA=Q TAG=Q
+static CODON_TABLE_6: [u8; 64] = make_table(&[(48, b'Q'), (50, b'Q')]);
+
+/// Code 9: Echinoderm and Flatworm Mitochondrial
+/// AAA=N AGA=S AGG=S TGA=W
+static CODON_TABLE_9: [u8; 64] = make_table(&[
+    (0, b'N'), (8, b'S'), (10, b'S'), (56, b'W'),
+]);
+
+/// Code 10: Euplotid Nuclear
+/// TGA=C
+static CODON_TABLE_10: [u8; 64] = make_table(&[(56, b'C')]);
+
+// Code 11: Bacterial, Archaeal and Plant Plastid - same as standard code 1.
+
+/// Code 12: Alternative Yeast Nuclear
+/// CTG=S
+static CODON_TABLE_12: [u8; 64] = make_table(&[(30, b'S')]);
+
+/// Code 13: Ascidian Mitochondrial
+/// AGA=G AGG=G ATA=M TGA=W
+static CODON_TABLE_13: [u8; 64] = make_table(&[
+    (8, b'G'), (10, b'G'), (12, b'M'), (56, b'W'),
+]);
+
+/// Code 14: Alternative Flatworm Mitochondrial
+/// AAA=N AGA=S AGG=S TAA=Y TGA=W
+static CODON_TABLE_14: [u8; 64] = make_table(&[
+    (0, b'N'), (8, b'S'), (10, b'S'), (48, b'Y'), (56, b'W'),
+]);
+
+/// Code 15: Blepharisma Nuclear
+/// TAG=Q
+static CODON_TABLE_15: [u8; 64] = make_table(&[(50, b'Q')]);
+
+/// Code 16: Chlorophycean Mitochondrial
+/// TAG=L
+static CODON_TABLE_16: [u8; 64] = make_table(&[(50, b'L')]);
+
+/// Code 21: Trematode Mitochondrial
+/// AAA=N AGA=S AGG=S ATA=M TGA=W
+static CODON_TABLE_21: [u8; 64] = make_table(&[
+    (0, b'N'), (8, b'S'), (10, b'S'), (12, b'M'), (56, b'W'),
+]);
+
+/// Code 22: Scenedesmus obliquus Mitochondrial
+/// TCA=* TAG=L
+static CODON_TABLE_22: [u8; 64] = make_table(&[(52, b'*'), (50, b'L')]);
+
+/// Code 23: Thraustochytrium Mitochondrial
+/// TTA=*
+static CODON_TABLE_23: [u8; 64] = make_table(&[(60, b'*')]);
+
+/// Code 24: Rhabdopleuridae Mitochondrial
+/// AGA=S AGG=K TGA=W
+static CODON_TABLE_24: [u8; 64] = make_table(&[
+    (8, b'S'), (10, b'K'), (56, b'W'),
+]);
+
+/// Code 25: Candidate Division SR1 and Gracilibacteria
+/// TGA=G
+static CODON_TABLE_25: [u8; 64] = make_table(&[(56, b'G')]);
+
+/// Code 26: Pachysolen tannophilus Nuclear
+/// CTG=A
+static CODON_TABLE_26: [u8; 64] = make_table(&[(30, b'A')]);
+
+/// Code 27: Karyorelictea Nuclear
+/// TAA=Q TAG=Q TGA=W
+static CODON_TABLE_27: [u8; 64] = make_table(&[
+    (48, b'Q'), (50, b'Q'), (56, b'W'),
+]);
+
+/// Code 29: Mesodinium Nuclear
+/// TAA=Y TAG=Y
+static CODON_TABLE_29: [u8; 64] = make_table(&[(48, b'Y'), (50, b'Y')]);
+
+/// Code 30: Peritrich Nuclear
+/// TAA=E TAG=E
+static CODON_TABLE_30: [u8; 64] = make_table(&[(48, b'E'), (50, b'E')]);
+
+/// Code 31: Blastocrithidia Nuclear
+/// TGA=W TAG=E TAA=E
+static CODON_TABLE_31: [u8; 64] = make_table(&[
+    (48, b'E'), (50, b'E'), (56, b'W'),
+]);
+
+/// Code 33: Cephalodiscidae Mitochondrial
+/// AGA=S AGG=K TAA=Y TGA=W
+static CODON_TABLE_33: [u8; 64] = make_table(&[
+    (8, b'S'), (10, b'K'), (48, b'Y'), (56, b'W'),
+]);
+
+/// Return the codon table for a given NCBI genetic code number (1-33).
+///
+/// Panics if the code is not a recognized NCBI genetic code.
+pub fn get_codon_table(code: u8) -> &'static [u8; 64] {
+    match code {
+        1 | 11 => &CODON_TABLE,
+        2  => &CODON_TABLE_2,
+        3  => &CODON_TABLE_3,
+        4  => &CODON_TABLE_4,
+        5  => &CODON_TABLE_5,
+        6  => &CODON_TABLE_6,
+        9  => &CODON_TABLE_9,
+        10 => &CODON_TABLE_10,
+        12 => &CODON_TABLE_12,
+        13 => &CODON_TABLE_13,
+        14 => &CODON_TABLE_14,
+        15 => &CODON_TABLE_15,
+        16 => &CODON_TABLE_16,
+        21 => &CODON_TABLE_21,
+        22 => &CODON_TABLE_22,
+        23 => &CODON_TABLE_23,
+        24 => &CODON_TABLE_24,
+        25 => &CODON_TABLE_25,
+        26 => &CODON_TABLE_26,
+        27 => &CODON_TABLE_27,
+        29 => &CODON_TABLE_29,
+        30 => &CODON_TABLE_30,
+        31 => &CODON_TABLE_31,
+        33 => &CODON_TABLE_33,
+        _  => panic!("Unsupported NCBI genetic code: {}", code),
+    }
+}
+
+/// Translate a single codon from 2-bit encoded bases using the standard code.
 /// Returns `b'X'` for ambiguous/unknown bases, `b'*'` for stop codons.
 #[inline]
 fn translate_codon(b1: u8, b2: u8, b3: u8) -> u8 {
@@ -66,13 +239,37 @@ fn translate_codon(b1: u8, b2: u8, b3: u8) -> u8 {
     CODON_TABLE[(b1 as usize) * 16 + (b2 as usize) * 4 + (b3 as usize)]
 }
 
+/// Translate a single codon from 2-bit encoded bases using the given table.
+/// Returns `b'X'` for ambiguous/unknown bases.
+#[inline]
+fn translate_codon_with_table(b1: u8, b2: u8, b3: u8, table: &[u8; 64]) -> u8 {
+    if b1 >= 4 || b2 >= 4 || b3 >= 4 { return b'X'; }
+    table[(b1 as usize) * 16 + (b2 as usize) * 4 + (b3 as usize)]
+}
+
 /// Translate a nucleotide sequence starting at `offset`, yielding ASCII amino acids.
+/// Uses the standard genetic code (code 1).
 /// Stop codons (`*`) are included in the output.
 pub fn translate_from(seq: &[u8], offset: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity((seq.len().saturating_sub(offset)) / 3 + 1);
     let mut i = offset;
     while i + 2 < seq.len() {
         out.push(translate_codon(nt_to_2bit(seq[i]), nt_to_2bit(seq[i+1]), nt_to_2bit(seq[i+2])));
+        i += 3;
+    }
+    out
+}
+
+/// Translate a nucleotide sequence starting at `offset` using the specified
+/// NCBI genetic code. Stop codons (`*`) are included in the output.
+pub fn translate_from_with_code(seq: &[u8], offset: usize, genetic_code: u8) -> Vec<u8> {
+    let table = get_codon_table(genetic_code);
+    let mut out = Vec::with_capacity((seq.len().saturating_sub(offset)) / 3 + 1);
+    let mut i = offset;
+    while i + 2 < seq.len() {
+        out.push(translate_codon_with_table(
+            nt_to_2bit(seq[i]), nt_to_2bit(seq[i+1]), nt_to_2bit(seq[i+2]), table,
+        ));
         i += 3;
     }
     out
@@ -113,7 +310,8 @@ impl TranslatedFrame {
     }
 }
 
-/// Translate all 6 reading frames of a nucleotide sequence.
+/// Translate all 6 reading frames of a nucleotide sequence using the standard
+/// genetic code (code 1).
 pub fn six_frame_translate(nt_seq: &[u8]) -> [TranslatedFrame; 6] {
     let nt_len = nt_seq.len();
     let rc = reverse_complement(nt_seq);
@@ -124,6 +322,21 @@ pub fn six_frame_translate(nt_seq: &[u8]) -> [TranslatedFrame; 6] {
         TranslatedFrame { frame: -1, protein: translate_from(&rc,    0), nt_len },
         TranslatedFrame { frame: -2, protein: translate_from(&rc,    1), nt_len },
         TranslatedFrame { frame: -3, protein: translate_from(&rc,    2), nt_len },
+    ]
+}
+
+/// Translate all 6 reading frames of a nucleotide sequence using the specified
+/// NCBI genetic code.
+pub fn six_frame_translate_with_code(nt_seq: &[u8], genetic_code: u8) -> [TranslatedFrame; 6] {
+    let nt_len = nt_seq.len();
+    let rc = reverse_complement(nt_seq);
+    [
+        TranslatedFrame { frame:  1, protein: translate_from_with_code(nt_seq, 0, genetic_code), nt_len },
+        TranslatedFrame { frame:  2, protein: translate_from_with_code(nt_seq, 1, genetic_code), nt_len },
+        TranslatedFrame { frame:  3, protein: translate_from_with_code(nt_seq, 2, genetic_code), nt_len },
+        TranslatedFrame { frame: -1, protein: translate_from_with_code(&rc,    0, genetic_code), nt_len },
+        TranslatedFrame { frame: -2, protein: translate_from_with_code(&rc,    1, genetic_code), nt_len },
+        TranslatedFrame { frame: -3, protein: translate_from_with_code(&rc,    2, genetic_code), nt_len },
     ]
 }
 

@@ -8,7 +8,7 @@ use crate::stats::{KarlinAltschul, GapPenalty, lookup_ka_params, blastn_ka_param
 use crate::lookup::{ProteinLookup, NucleotideLookup};
 use crate::extend::{ungapped_extend, gapped_extend, ungapped_extend_nucleotide};
 use crate::hsp::{Hsp, SearchResult};
-use crate::translate::{six_frame_translate, strip_stops, TranslatedFrame};
+use crate::translate::{six_frame_translate_with_code, strip_stops, TranslatedFrame, reverse_complement};
 use crate::compo::{composition_ncbistdaa, adjust_evalue};
 
 /// Parameters for a BLAST search.
@@ -33,6 +33,26 @@ pub struct SearchParams {
     pub filter_low_complexity: bool,
     /// Apply composition-based statistics adjustment.
     pub comp_adjust: bool,
+    /// Query strand: "both", "plus", or "minus" (for nucleotide searches).
+    pub strand: String,
+    /// Genetic code for query translation (1=standard, 2=vert mito, etc.)
+    pub query_gencode: u8,
+    /// Genetic code for database translation.
+    pub db_gencode: u8,
+    /// Maximum HSPs per subject sequence (None = no limit).
+    pub max_hsps: Option<usize>,
+    /// Culling limit (limits hits aligning to same region; None = disabled).
+    pub culling_limit: Option<usize>,
+    /// Use 2-hit algorithm for seeding (default true for protein)
+    pub two_hit: bool,
+    /// Window size for 2-hit algorithm (default 40)
+    pub two_hit_window: usize,
+    /// Final X-dropoff for gapped extension (higher than initial, default 25 for protein)
+    pub x_drop_final: i32,
+    /// Soft masking: mask for seeding/lookup only, use unmasked for extension
+    pub soft_masking: bool,
+    /// Lowercase masking: treat lowercase letters in query as masked
+    pub lcase_masking: bool,
 }
 
 impl Default for SearchParams {
@@ -52,6 +72,16 @@ impl SearchParams {
             num_threads: 0,
             filter_low_complexity: true,
             comp_adjust: true,
+            strand: "both".to_string(),
+            query_gencode: 1,
+            db_gencode: 1,
+            max_hsps: None,
+            culling_limit: None,
+            two_hit: true,
+            two_hit_window: 40,
+            x_drop_final: 25,
+            soft_masking: false,
+            lcase_masking: false,
         }
     }
 
@@ -67,6 +97,16 @@ impl SearchParams {
             num_threads: 0,
             filter_low_complexity: true,
             comp_adjust: false, // composition adjustment not standard for blastn
+            strand: "both".to_string(),
+            query_gencode: 1,
+            db_gencode: 1,
+            max_hsps: None,
+            culling_limit: None,
+            two_hit: false,
+            two_hit_window: 0,
+            x_drop_final: 100,
+            soft_masking: false,
+            lcase_masking: false,
         }
     }
 
@@ -113,6 +153,16 @@ impl SearchParams {
     pub fn comp_adjust(mut self, v: bool) -> Self { self.comp_adjust = v; self }
     pub fn match_score(mut self, v: i32) -> Self { self.match_score = v; self }
     pub fn mismatch(mut self, v: i32) -> Self { self.mismatch = v; self }
+    pub fn strand(mut self, v: &str) -> Self { self.strand = v.to_string(); self }
+    pub fn query_gencode(mut self, v: u8) -> Self { self.query_gencode = v; self }
+    pub fn db_gencode(mut self, v: u8) -> Self { self.db_gencode = v; self }
+    pub fn max_hsps(mut self, v: Option<usize>) -> Self { self.max_hsps = v; self }
+    pub fn culling_limit(mut self, v: Option<usize>) -> Self { self.culling_limit = v; self }
+    pub fn two_hit(mut self, v: bool) -> Self { self.two_hit = v; self }
+    pub fn two_hit_window(mut self, v: usize) -> Self { self.two_hit_window = v; self }
+    pub fn x_drop_final(mut self, v: i32) -> Self { self.x_drop_final = v; self }
+    pub fn soft_masking(mut self, v: bool) -> Self { self.soft_masking = v; self }
+    pub fn lcase_masking(mut self, v: bool) -> Self { self.lcase_masking = v; self }
 }
 
 /// Neighbor word score threshold for protein lookup.
@@ -122,7 +172,9 @@ pub(crate) fn neighbor_threshold(matrix: MatrixType, word_size: usize) -> i32 {
         (MatrixType::Blosum62, 3) => 11,
         (MatrixType::Blosum62, 2) => 8,
         (MatrixType::Blosum45, 3) => 14,
+        (MatrixType::Blosum50, 3) => 13,
         (MatrixType::Blosum80, 3) => 25,
+        (MatrixType::Blosum90, 3) => 27,
         (MatrixType::Pam30, 3)    => 10,
         (MatrixType::Pam70, 3)    => 11,
         (MatrixType::Pam250, 3)   => 11,
@@ -136,13 +188,21 @@ pub fn blast_search(
     query: &[u8],   // Ncbistdaa encoded query
     params: &SearchParams,
 ) -> Vec<SearchResult> {
-    // Optional SEG masking on query
-    let query_work: Vec<u8> = if params.filter_low_complexity {
+    // For soft masking: mask query for lookup, but use unmasked for extension
+    let query_masked: Vec<u8> = if params.filter_low_complexity {
         let mut q = query.to_vec();
         crate::mask::apply_seg_ncbistdaa(&mut q);
         q
     } else {
         query.to_vec()
+    };
+
+    // For extension, use unmasked query if soft_masking is enabled
+    let query_for_lookup = &query_masked;
+    let query_for_extend: &[u8] = if params.soft_masking && params.filter_low_complexity {
+        query // original unmasked
+    } else {
+        &query_masked
     };
 
     let matrix = ScoringMatrix::from_type(params.matrix);
@@ -158,12 +218,12 @@ pub fn blast_search(
 
     let db_len = db.volume_length();
     let num_seqs = db.num_sequences() as u64;
-    let (eff_query_len, eff_db_len) = ka.effective_lengths(query_work.len(), db_len, num_seqs);
+    let (eff_query_len, eff_db_len) = ka.effective_lengths(query_for_lookup.len(), db_len, num_seqs);
 
     let threshold = neighbor_threshold(params.matrix, params.word_size);
-    let lookup = ProteinLookup::build(&query_work, params.word_size, &matrix, threshold);
+    let lookup = ProteinLookup::build(query_for_lookup, params.word_size, &matrix, threshold);
 
-    let query_comp = if params.comp_adjust { Some(composition_ncbistdaa(&query_work)) } else { None };
+    let query_comp = if params.comp_adjust { Some(composition_ncbistdaa(query_for_extend)) } else { None };
 
     // Process each OID (parallelized with rayon)
     let oids: Vec<u32> = (0..db.num_sequences()).collect();
@@ -176,7 +236,7 @@ pub fn blast_search(
         if subject.is_empty() { return None; }
 
         let mut hsps = search_one_protein(
-            &query_work, &subject, &lookup, &matrix, &ka, params, eff_query_len, eff_db_len,
+            query_for_extend, &subject, &lookup, &matrix, &ka, params, eff_query_len, eff_db_len,
         );
 
         // Composition adjustment
@@ -192,6 +252,11 @@ pub fn blast_search(
         }
 
         if hsps.is_empty() { return None; }
+
+        // Apply max_hsps limit per subject
+        if let Some(max) = params.max_hsps {
+            hsps.truncate(max);
+        }
 
         let header = db.get_header(oid).unwrap_or_default();
         Some(SearchResult {
@@ -223,32 +288,68 @@ fn search_one_protein(
     let ws = lookup.word_size;
     if slen < ws { return vec![]; }
 
-    // Track extended regions to avoid redundant extensions
-    // A simple hit-deduplication: if we've already extended from a nearby diagonal, skip.
-    let mut diag_hit: Vec<bool> = vec![false; query.len() + slen + 1];
     let diag_offset = query.len();
-
+    let diag_len = query.len() + slen + 1;
     let mut ungapped_hits = Vec::new();
 
-    // Scan subject for k-mer hits
-    for s_pos in 0..=(slen - ws) {
-        let word = &subject[s_pos..s_pos + ws];
-        if let Some(q_positions) = lookup.lookup(word) {
-            for &q_pos in q_positions {
-                let q_pos = q_pos as usize;
-                // Diagonal = s_pos - q_pos (offset to avoid negative)
-                let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
-                if diag < diag_hit.len() && diag_hit[diag] {
-                    continue;
-                }
+    if params.two_hit {
+        // 2-hit mode: require two hits on the same diagonal within a window
+        let mut diag_last: Vec<i32> = vec![i32::MIN; diag_len];
+        let mut diag_extended: Vec<bool> = vec![false; diag_len];
 
-                let hit = ungapped_extend(query, subject, q_pos, s_pos, matrix, params.x_drop_ungapped);
-                let cutoff = params.ungapped_cutoff.max(1);
-                if hit.score >= cutoff {
-                    if diag < diag_hit.len() {
-                        diag_hit[diag] = true;
+        for s_pos in 0..=(slen - ws) {
+            let word = &subject[s_pos..s_pos + ws];
+            if let Some(q_positions) = lookup.lookup(word) {
+                for &q_pos in q_positions {
+                    let q_pos = q_pos as usize;
+                    let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
+                    if diag >= diag_extended.len() { continue; }
+                    if diag_extended[diag] { continue; }
+
+                    let prev = diag_last[diag];
+                    if prev == i32::MIN {
+                        diag_last[diag] = s_pos as i32;
+                        continue;
                     }
-                    ungapped_hits.push(hit);
+
+                    let dist = (s_pos as i32) - prev;
+                    if dist > params.two_hit_window as i32 {
+                        diag_last[diag] = s_pos as i32;
+                        continue;
+                    }
+
+                    // 2nd hit within window -> extend
+                    let hit = ungapped_extend(query, subject, q_pos, s_pos, matrix, params.x_drop_ungapped);
+                    let cutoff = params.ungapped_cutoff.max(1);
+                    if hit.score >= cutoff {
+                        diag_extended[diag] = true;
+                        ungapped_hits.push(hit);
+                    }
+                }
+            }
+        }
+    } else {
+        // Single-hit mode (original behavior)
+        let mut diag_hit: Vec<bool> = vec![false; diag_len];
+
+        for s_pos in 0..=(slen - ws) {
+            let word = &subject[s_pos..s_pos + ws];
+            if let Some(q_positions) = lookup.lookup(word) {
+                for &q_pos in q_positions {
+                    let q_pos = q_pos as usize;
+                    let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
+                    if diag < diag_hit.len() && diag_hit[diag] {
+                        continue;
+                    }
+
+                    let hit = ungapped_extend(query, subject, q_pos, s_pos, matrix, params.x_drop_ungapped);
+                    let cutoff = params.ungapped_cutoff.max(1);
+                    if hit.score >= cutoff {
+                        if diag < diag_hit.len() {
+                            diag_hit[diag] = true;
+                        }
+                        ungapped_hits.push(hit);
+                    }
                 }
             }
         }
@@ -312,16 +413,51 @@ fn search_one_protein(
         });
     }
 
+    // Final gapped extension with higher X-drop for accepted HSPs
+    if params.x_drop_final > params.x_drop_gapped {
+        for hsp in &mut hsps {
+            let center_q = (hsp.query_start + hsp.query_end) / 2;
+            let center_s = (hsp.subject_start + hsp.subject_end) / 2;
+            let gh = gapped_extend(query, subject, center_q, center_s, matrix,
+                                   params.gap_open, params.gap_extend, params.x_drop_final);
+            if gh.score > hsp.score {
+                let evalue = ka.evalue(gh.score, eff_query_len, eff_db_len);
+                let query_aln = blast_db::sequence::decode_protein(&gh.query_aln);
+                let subject_aln = blast_db::sequence::decode_protein(&gh.subject_aln);
+                *hsp = Hsp {
+                    score: gh.score, bit_score: ka.bit_score(gh.score), evalue,
+                    query_start: gh.q_start, query_end: gh.q_end,
+                    subject_start: gh.s_start, subject_end: gh.s_end,
+                    num_identities: gh.num_identities, num_gaps: gh.num_gaps,
+                    alignment_length: gh.query_aln.len(),
+                    query_aln, midline: gh.midline, subject_aln,
+                    query_frame: 0, subject_frame: 0,
+                };
+            }
+        }
+    }
+
     hsps.sort_by(|a, b| a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal));
     hsps
 }
 
 /// Run a nucleotide BLAST search (blastn).
+///
+/// Respects `params.strand`: "plus" searches forward only, "minus" searches
+/// reverse complement only, "both" (default) searches both strands.
 pub fn blastn_search(
     db: &BlastDb,
     query: &[u8],   // ASCII nucleotide query
     params: &SearchParams,
 ) -> Vec<SearchResult> {
+    // Determine which query orientations to search based on strand selection.
+    // Each entry: (query bytes, query_frame: 0=forward, 0=revcomp but we use 1/-1 convention)
+    let queries_to_search: Vec<(Vec<u8>, i32)> = match params.strand.as_str() {
+        "plus"  => vec![(query.to_vec(), 1)],
+        "minus" => vec![(reverse_complement(query), -1)],
+        _       => vec![(query.to_vec(), 1), (reverse_complement(query), -1)],
+    };
+
     let ka = blastn_ka_params(
         params.match_score, params.mismatch,
         params.gap_open, params.gap_extend,
@@ -331,37 +467,66 @@ pub fn blastn_search(
     let num_seqs = db.num_sequences() as u64;
     let (eff_query_len, eff_db_len) = ka.effective_lengths(query.len(), db_len, num_seqs);
 
-    let lookup = NucleotideLookup::build(query, params.word_size);
+    use std::collections::HashMap;
+    let mut merged: HashMap<u32, SearchResult> = HashMap::new();
 
-    let oids: Vec<u32> = (0..db.num_sequences()).collect();
+    for (q_seq, q_frame) in &queries_to_search {
+        let lookup = NucleotideLookup::build(q_seq, params.word_size);
 
-    let mut results: Vec<SearchResult> = oids.par_iter().filter_map(|&oid| {
-        let subject = match db.get_sequence_nucleotide(oid) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
-        if subject.is_empty() { return None; }
+        let oids: Vec<u32> = (0..db.num_sequences()).collect();
 
-        let hsps = search_one_nucleotide(
-            query,
-            &subject,
-            &lookup,
-            &ka,
-            params,
-            eff_query_len,
-            eff_db_len,
-        );
+        let strand_results: Vec<SearchResult> = oids.par_iter().filter_map(|&oid| {
+            let subject = match db.get_sequence_nucleotide(oid) {
+                Ok(s) => s,
+                Err(_) => return None,
+            };
+            if subject.is_empty() { return None; }
 
-        if hsps.is_empty() { return None; }
+            let mut hsps = search_one_nucleotide(
+                q_seq,
+                &subject,
+                &lookup,
+                &ka,
+                params,
+                eff_query_len,
+                eff_db_len,
+            );
 
-        let header = db.get_header(oid).unwrap_or_default();
-        Some(SearchResult {
-            subject_oid: oid,
-            subject_title: header.title,
-            subject_accession: header.accession,
-            subject_len: subject.len(),
-            hsps,
-        })
+            // Set query_frame on HSPs so output can distinguish strands
+            for hsp in &mut hsps {
+                hsp.query_frame = *q_frame;
+            }
+
+            // Apply max_hsps limit per subject
+            if let Some(max) = params.max_hsps {
+                hsps.truncate(max);
+            }
+
+            if hsps.is_empty() { return None; }
+
+            let header = db.get_header(oid).unwrap_or_default();
+            Some(SearchResult {
+                subject_oid: oid,
+                subject_title: header.title,
+                subject_accession: header.accession,
+                subject_len: subject.len(),
+                hsps,
+            })
+        }).collect();
+
+        for result in strand_results {
+            merged.entry(result.subject_oid)
+                .and_modify(|e| e.hsps.extend(result.hsps.iter().cloned()))
+                .or_insert(result);
+        }
+    }
+
+    let mut results: Vec<SearchResult> = merged.into_values().map(|mut r| {
+        r.hsps.sort_by(|a, b| a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(max) = params.max_hsps {
+            r.hsps.truncate(max);
+        }
+        r
     }).collect();
 
     results.sort_by(|a, b| a.best_evalue().partial_cmp(&b.best_evalue()).unwrap_or(std::cmp::Ordering::Equal));
@@ -379,24 +544,65 @@ fn search_one_nucleotide(
     eff_db_len: u64,
 ) -> Vec<Hsp> {
     let diag_offset = query.len();
-    let mut diag_hit: Vec<bool> = vec![false; query.len() + subject.len() + 1];
+    let diag_len = query.len() + subject.len() + 1;
     let mut ungapped_hits = Vec::new();
 
-    for (q_pos, s_pos) in lookup.scan_subject(subject) {
-        let q_pos = q_pos as usize;
-        let s_pos = s_pos as usize;
-        let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
-        if diag < diag_hit.len() && diag_hit[diag] { continue; }
+    if params.two_hit {
+        // 2-hit mode for nucleotide
+        let mut diag_last: Vec<i32> = vec![i32::MIN; diag_len];
+        let mut diag_extended: Vec<bool> = vec![false; diag_len];
 
-        let hit = ungapped_extend_nucleotide(
-            query, subject,
-            q_pos, s_pos,
-            params.match_score, params.mismatch,
-            params.x_drop_ungapped,
-        );
-        if hit.score > 0 {
-            if diag < diag_hit.len() { diag_hit[diag] = true; }
-            ungapped_hits.push(hit);
+        for (q_pos, s_pos) in lookup.scan_subject(subject) {
+            let q_pos = q_pos as usize;
+            let s_pos = s_pos as usize;
+            let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
+            if diag >= diag_extended.len() { continue; }
+            if diag_extended[diag] { continue; }
+
+            let prev = diag_last[diag];
+            if prev == i32::MIN {
+                diag_last[diag] = s_pos as i32;
+                continue;
+            }
+
+            let dist = (s_pos as i32) - prev;
+            if dist > params.two_hit_window as i32 {
+                diag_last[diag] = s_pos as i32;
+                continue;
+            }
+
+            // 2nd hit within window -> extend
+            let hit = ungapped_extend_nucleotide(
+                query, subject,
+                q_pos, s_pos,
+                params.match_score, params.mismatch,
+                params.x_drop_ungapped,
+            );
+            if hit.score > 0 {
+                diag_extended[diag] = true;
+                ungapped_hits.push(hit);
+            }
+        }
+    } else {
+        // Single-hit mode (original behavior)
+        let mut diag_hit: Vec<bool> = vec![false; diag_len];
+
+        for (q_pos, s_pos) in lookup.scan_subject(subject) {
+            let q_pos = q_pos as usize;
+            let s_pos = s_pos as usize;
+            let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
+            if diag < diag_hit.len() && diag_hit[diag] { continue; }
+
+            let hit = ungapped_extend_nucleotide(
+                query, subject,
+                q_pos, s_pos,
+                params.match_score, params.mismatch,
+                params.x_drop_ungapped,
+            );
+            if hit.score > 0 {
+                if diag < diag_hit.len() { diag_hit[diag] = true; }
+                ungapped_hits.push(hit);
+            }
         }
     }
 
@@ -473,7 +679,7 @@ fn build_nt_matrix(match_score: i32, mismatch: i32) -> ScoringMatrix {
 
 // ─── Helper: ascii amino acid → Ncbistdaa ────────────────────────────────────
 
-pub(crate) fn aa_to_ncbistdaa(seq: &[u8]) -> Vec<u8> {
+pub fn aa_to_ncbistdaa(seq: &[u8]) -> Vec<u8> {
     seq.iter().map(|&c| match c.to_ascii_uppercase() {
         b'A' => 1,  b'B' => 2,  b'C' => 3,  b'D' => 4,  b'E' => 5,
         b'F' => 6,  b'G' => 7,  b'H' => 8,  b'I' => 9,  b'K' => 10,
@@ -494,14 +700,22 @@ pub fn blastx_search(
     nt_query: &[u8], // ASCII nucleotide
     params: &SearchParams,
 ) -> Vec<SearchResult> {
-    // Translate in all 6 frames; collect per-frame results, adjust coordinates
-    let frames = six_frame_translate(nt_query);
+    // Translate in 6 frames using the specified query genetic code
+    let frames = six_frame_translate_with_code(nt_query, params.query_gencode);
 
     // We must merge results across frames: same subject OID may appear multiple times.
     use std::collections::HashMap;
     let mut merged: HashMap<u32, SearchResult> = HashMap::new();
 
     for frame in &frames {
+        // Filter frames based on strand selection
+        let skip = match params.strand.as_str() {
+            "plus"  => frame.frame < 0,
+            "minus" => frame.frame > 0,
+            _ => false,
+        };
+        if skip { continue; }
+
         let prot_ascii = strip_stops(&frame.protein);
         if prot_ascii.len() < params.word_size { continue; }
 
@@ -535,6 +749,9 @@ pub fn blastx_search(
 
     let mut results: Vec<SearchResult> = merged.into_values().map(|mut r| {
         r.hsps.sort_by(|a, b| a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(max) = params.max_hsps {
+            r.hsps.truncate(max);
+        }
         r
     }).collect();
 
@@ -585,7 +802,7 @@ pub fn tblastn_search(
         };
         if nt_subject.len() < 3 { return None; }
 
-        let frames = six_frame_translate(&nt_subject);
+        let frames = six_frame_translate_with_code(&nt_subject, params.db_gencode);
         let mut all_hsps: Vec<Hsp> = Vec::new();
 
         for frame in &frames {
@@ -615,6 +832,9 @@ pub fn tblastn_search(
 
         if all_hsps.is_empty() { return None; }
         all_hsps.sort_by(|a, b| a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(max) = params.max_hsps {
+            all_hsps.truncate(max);
+        }
 
         let header = db.get_header(oid).unwrap_or_default();
         Some(SearchResult {
@@ -643,7 +863,7 @@ pub fn tblastx_search(
     nt_query: &[u8], // ASCII nucleotide query
     params: &SearchParams,
 ) -> Vec<SearchResult> {
-    let query_frames = six_frame_translate(nt_query);
+    let query_frames = six_frame_translate_with_code(nt_query, params.query_gencode);
 
     let matrix = ScoringMatrix::from_type(params.matrix);
     let gap = GapPenalty::new(params.gap_open, params.gap_extend);
@@ -655,9 +875,17 @@ pub fn tblastx_search(
     let db_aa_len = db.volume_length() * 2;
     let num_seqs = db.num_sequences() as u64;
 
-    // Build lookup tables for all 6 query frames
+    // Build lookup tables for query frames (filtered by strand selection)
     let q_frames_ncbi: Vec<(TranslatedFrame, Vec<u8>, ProteinLookup)> = query_frames.iter()
         .filter_map(|frame| {
+            // Filter frames based on strand selection
+            let skip = match params.strand.as_str() {
+                "plus"  => frame.frame < 0,
+                "minus" => frame.frame > 0,
+                _ => false,
+            };
+            if skip { return None; }
+
             let prot = strip_stops(&frame.protein);
             if prot.len() < params.word_size { return None; }
             let mut masked = prot.clone();
@@ -678,7 +906,7 @@ pub fn tblastx_search(
         };
         if nt_subject.len() < 3 { return None; }
 
-        let subj_frames = six_frame_translate(&nt_subject);
+        let subj_frames = six_frame_translate_with_code(&nt_subject, params.db_gencode);
         let mut all_hsps: Vec<Hsp> = Vec::new();
 
         for (q_frame, q_ncbi, q_lookup) in &q_frames_ncbi {
@@ -709,6 +937,9 @@ pub fn tblastx_search(
 
         if all_hsps.is_empty() { return None; }
         all_hsps.sort_by(|a, b| a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(max) = params.max_hsps {
+            all_hsps.truncate(max);
+        }
 
         let header = db.get_header(oid).unwrap_or_default();
         Some(SearchResult {

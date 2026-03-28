@@ -143,7 +143,7 @@ pub fn find_adjusted_lambda(
     Some(lambda_prime)
 }
 
-/// Adjust an E-value using per-sequence composition correction.
+/// Adjust an E-value using per-sequence composition correction (mode 1).
 ///
 /// Returns the adjusted E-value, or the original if correction is inapplicable.
 pub fn adjust_evalue(
@@ -160,10 +160,82 @@ pub fn adjust_evalue(
     match find_adjusted_lambda(q, r, matrix, lambda_standard) {
         None => raw_evalue,
         Some(lambda_prime) => {
-            // E = m * n * K * exp(-lambda' * score)
-            // Use the same K; only lambda changes.
             (eff_query_len as f64) * (eff_db_len as f64) * k
                 * (-(lambda_prime * score as f64)).exp()
         }
     }
+}
+
+/// Adjust E-value with mode selection:
+///   0 = no adjustment (returns raw_evalue)
+///   1 = unconditional composition-based λ adjustment (original method)
+///   2 = conditional: only apply if expected score diverges significantly from standard
+///   3 = unconditional adjustment (same as 1 but always applied, even if expected_score ≥ 0)
+pub fn adjust_evalue_with_mode(
+    raw_evalue: f64,
+    score: i32,
+    q: &[f64; 28],
+    r: &[f64; 28],
+    matrix: &ScoringMatrix,
+    lambda_standard: f64,
+    k: f64,
+    eff_query_len: usize,
+    eff_db_len: u64,
+    mode: u8,
+) -> f64 {
+    match mode {
+        0 => raw_evalue,
+        1 => adjust_evalue(raw_evalue, score, q, r, matrix, lambda_standard, k, eff_query_len, eff_db_len),
+        2 => {
+            // Conditional: only apply when composition differs significantly
+            // from background. Threshold: expected score < -0.2 * lambda_standard
+            let mu_bg = expected_score_with_bg(matrix, lambda_standard);
+            let mu_actual = expected_score(q, r, matrix);
+            let threshold = -0.2 * lambda_standard;
+            if (mu_actual - mu_bg).abs() > threshold.abs() {
+                adjust_evalue(raw_evalue, score, q, r, matrix, lambda_standard, k, eff_query_len, eff_db_len)
+            } else {
+                raw_evalue
+            }
+        }
+        3 => {
+            // Unconditional: force find adjusted lambda even if expected score ≥ 0
+            let eval_sum = |lam: f64| -> f64 {
+                let mut sum = 0.0f64;
+                for i in 1..23usize {
+                    for j in 1..23usize {
+                        let s = matrix.score(i as u8, j as u8) as f64;
+                        sum += q[i] * r[j] * (lam * s).exp();
+                    }
+                }
+                sum
+            };
+
+            let mut lo = 0.0f64;
+            let mut hi = lambda_standard * 4.0;
+            if eval_sum(hi) >= 1.0 { return raw_evalue; }
+            if eval_sum(lo) < 1.0 { return raw_evalue; }
+
+            for _ in 0..60 {
+                let mid = (lo + hi) / 2.0;
+                if eval_sum(mid) > 1.0 { lo = mid; } else { hi = mid; }
+                if hi - lo < 1e-10 { break; }
+            }
+            let lambda_prime = (lo + hi) / 2.0;
+            (eff_query_len as f64) * (eff_db_len as f64) * k
+                * (-(lambda_prime * score as f64)).exp()
+        }
+        _ => raw_evalue,
+    }
+}
+
+/// Expected score under background frequencies (for mode 2 comparison).
+fn expected_score_with_bg(matrix: &ScoringMatrix, _lambda: f64) -> f64 {
+    let mut mu = 0.0f64;
+    for i in 1..23usize {
+        for j in 1..23usize {
+            mu += BACKGROUND_FREQ[i] * BACKGROUND_FREQ[j] * matrix.score(i as u8, j as u8) as f64;
+        }
+    }
+    mu
 }

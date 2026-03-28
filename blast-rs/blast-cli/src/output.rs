@@ -72,6 +72,10 @@ pub struct SearchContext<'a> {
     pub gap_extend: i32,
     pub evalue_threshold: f64,
     pub iter_num: usize, // 1-based, for multi-query XML/JSON
+    /// Maximum number of one-line descriptions to show (None = all)
+    pub num_descriptions: Option<usize>,
+    /// Maximum number of alignments to show (None = all)
+    pub num_alignments: Option<usize>,
 }
 
 /// Write all results for one query in the requested format.
@@ -90,9 +94,10 @@ pub fn write_results(
         4 => fmt34_flat(out, ctx, results, true),
         5 => fmt5_xml(out, ctx, results),
         6 | 7 | 10 => fmt6_tabular(out, ctx, results, fmt),
-        8 | 9 | 11 | 12 | 13 | 14 | 18 => {
+        8 | 9 | 11 | 12 | 13 | 14 => {
             writeln!(out, "# Format {} is not implemented.", fmt.fmt_id)
         }
+        18 => fmt18_sam(out, ctx, results),
         15 => fmt15_json(out, ctx, results),
         16 => fmt16_xml2(out, ctx, results),
         17 => fmt17_fasta(out, ctx, results, db),
@@ -159,15 +164,17 @@ fn fmt0_pairwise(
     writeln!(out, "                                                                 Score     E")?;
     writeln!(out, "Sequences producing significant alignments:                      (Bits)  Value")?;
     writeln!(out)?;
-    for r in results {
+    let desc_limit = ctx.num_descriptions.unwrap_or(results.len());
+    for r in results.iter().take(desc_limit) {
         let title = subject_title(r);
         let best = &r.hsps[0];
         writeln!(out, "{:<67} {:.0}  {:.2e}", &title[..title.len().min(67)], best.bit_score, best.evalue)?;
     }
     writeln!(out)?;
 
+    let aln_limit = ctx.num_alignments.unwrap_or(results.len());
     writeln!(out, "ALIGNMENTS")?;
-    for r in results {
+    for r in results.iter().take(aln_limit) {
         let title = subject_title(r);
         writeln!(out, "> {}", title)?;
         writeln!(out, "   Length = {}", r.subject_len)?;
@@ -307,6 +314,14 @@ pub enum TabularColumn {
     Qcovs,
     QcovHsp,
     Score,
+    // Additional columns
+    Qframe,
+    Sframe,
+    Frames,
+    Stitle,
+    Sacc,
+    Sstrand,
+    Qcovus,
 }
 
 impl TabularColumn {
@@ -338,6 +353,13 @@ impl TabularColumn {
             "qcovs"      => Self::Qcovs,
             "qcovhsp"    => Self::QcovHsp,
             "score"      => Self::Score,
+            "qframe"     => Self::Qframe,
+            "sframe"     => Self::Sframe,
+            "frames"     => Self::Frames,
+            "stitle"     => Self::Stitle,
+            "sacc"       => Self::Sacc,
+            "sstrand"    => Self::Sstrand,
+            "qcovus"     => Self::Qcovus,
             _ => return None,
         })
     }
@@ -379,6 +401,13 @@ impl TabularColumn {
             Self::Qcovs      => "qcovs",
             Self::QcovHsp    => "qcovhsp",
             Self::Score      => "score",
+            Self::Qframe     => "qframe",
+            Self::Sframe     => "sframe",
+            Self::Frames     => "frames",
+            Self::Stitle     => "stitle",
+            Self::Sacc       => "sacc",
+            Self::Sstrand    => "sstrand",
+            Self::Qcovus     => "qcovus",
         }
     }
 }
@@ -469,6 +498,22 @@ fn tabular_field(
             }
         }
         TabularColumn::QcovHsp    => {
+            if ctx.query_len == 0 { "0".to_string() }
+            else {
+                let cov_len = hsp.query_end - hsp.query_start;
+                format!("{}", (100 * cov_len / ctx.query_len).min(100))
+            }
+        }
+        TabularColumn::Qframe     => hsp.query_frame.to_string(),
+        TabularColumn::Sframe     => hsp.subject_frame.to_string(),
+        TabularColumn::Frames     => format!("{}/{}", hsp.query_frame, hsp.subject_frame),
+        TabularColumn::Stitle     => r.subject_title.clone(),
+        TabularColumn::Sacc       => r.subject_accession.clone(),
+        TabularColumn::Sstrand    => {
+            if hsp.subject_frame < 0 { "minus".to_string() }
+            else { "plus".to_string() }
+        }
+        TabularColumn::Qcovus     => {
             if ctx.query_len == 0 { "0".to_string() }
             else {
                 let cov_len = hsp.query_end - hsp.query_start;
@@ -680,6 +725,94 @@ fn fmt17_fasta(
         }
     }
     Ok(())
+}
+
+// ─── Format 18: SAM ───────────────────────────────────────────────────────
+
+fn fmt18_sam(
+    out: &mut impl Write,
+    ctx: &SearchContext<'_>,
+    results: &[SearchResult],
+) -> io::Result<()> {
+    // SAM header
+    writeln!(out, "@HD\tVN:1.6\tSO:queryname")?;
+    for r in results {
+        writeln!(out, "@SQ\tSN:{}\tLN:{}", r.subject_accession, r.subject_len)?;
+    }
+    writeln!(out, "@PG\tID:blast-cli\tPN:{}\tVN:0.1.0", ctx.program)?;
+
+    let qname = first_word(ctx.query_title);
+
+    for r in results {
+        let rname = if !r.subject_accession.is_empty() { &r.subject_accession } else { &r.subject_title };
+
+        for hsp in &r.hsps {
+            // FLAG: 0 for forward, 16 for reverse
+            let flag = if hsp.subject_frame < 0 || hsp.query_frame < 0 { 16 } else { 0 };
+
+            // POS: 1-based subject start
+            let pos = hsp.subject_start + 1;
+
+            // MAPQ: derived from e-value (approximate)
+            let mapq = if hsp.evalue <= 0.0 { 255 }
+                else { ((-10.0 * hsp.evalue.log10()).min(255.0).max(0.0)) as u8 };
+
+            // Build CIGAR from alignment
+            let cigar = build_cigar(&hsp.query_aln, &hsp.subject_aln);
+
+            // SEQ: query sequence from alignment (gaps removed)
+            let seq: String = hsp.query_aln.iter()
+                .filter(|&&b| b != b'-')
+                .map(|&b| b as char)
+                .collect();
+
+            // QUAL: unavailable
+            let qual = "*";
+
+            // Optional fields
+            let as_tag = format!("AS:i:{}", hsp.score);
+            let bs_tag = format!("BS:f:{:.1}", hsp.bit_score);
+            let ev_tag = format!("EV:f:{:.2e}", hsp.evalue);
+            let nm_tag = format!("NM:i:{}", hsp.alignment_length - hsp.num_identities);
+
+            writeln!(out, "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}\t{}\t{}\t{}\t{}",
+                qname, flag, rname, pos, mapq, cigar, seq, qual,
+                as_tag, bs_tag, ev_tag, nm_tag)?;
+        }
+    }
+    Ok(())
+}
+
+/// Build a CIGAR string from query and subject alignment strings.
+fn build_cigar(query_aln: &[u8], subject_aln: &[u8]) -> String {
+    let mut cigar = String::new();
+    let mut last_op = ' ';
+    let mut run = 0usize;
+
+    for (&q, &s) in query_aln.iter().zip(subject_aln.iter()) {
+        let op = if q == b'-' {
+            'D' // deletion from reference (gap in query)
+        } else if s == b'-' {
+            'I' // insertion to reference (gap in subject)
+        } else {
+            'M' // alignment match (or mismatch)
+        };
+
+        if op == last_op {
+            run += 1;
+        } else {
+            if run > 0 {
+                cigar.push_str(&format!("{}{}", run, last_op));
+            }
+            last_op = op;
+            run = 1;
+        }
+    }
+    if run > 0 {
+        cigar.push_str(&format!("{}{}", run, last_op));
+    }
+
+    if cigar.is_empty() { "*".to_string() } else { cigar }
 }
 
 // ─── Shared alignment helpers ───────────────────────────────────────────────

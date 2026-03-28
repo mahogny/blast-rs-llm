@@ -39,6 +39,8 @@ enum Commands {
     Dumpdb(DumpArgs),
     /// Build a BLAST database from a FASTA file
     Makeblastdb(MakeDbArgs),
+    /// Retrieve sequences or information from a BLAST database
+    Blastdbcmd(BlastdbcmdArgs),
 }
 
 #[derive(clap::Args)]
@@ -89,6 +91,63 @@ struct BlastArgs {
     /// Disable composition-based statistics adjustment
     #[arg(long = "no-comp-adjust")]
     no_comp_adjust: bool,
+    /// Query strand: both, plus, minus (nucleotide searches only)
+    #[arg(long, default_value = "both")]
+    strand: String,
+    /// Genetic code for query (blastx/tblastx)
+    #[arg(long = "query_gencode", default_value = "1")]
+    query_gencode: u8,
+    /// Genetic code for database (tblastn/tblastx)
+    #[arg(long = "db_gencode", default_value = "1")]
+    db_gencode: u8,
+    /// Maximum HSPs per subject
+    #[arg(long = "max_hsps")]
+    max_hsps: Option<usize>,
+    /// Culling limit
+    #[arg(long = "culling_limit")]
+    culling_limit: Option<usize>,
+    /// Search task preset (e.g. megablast, blastn-short, blastp-fast)
+    #[arg(long)]
+    task: Option<String>,
+    /// Restrict search to sequences with these taxonomy IDs (comma-separated)
+    #[arg(long)]
+    taxids: Option<String>,
+    /// File of taxonomy IDs to restrict search (one per line)
+    #[arg(long)]
+    taxidlist: Option<PathBuf>,
+    /// File of sequence IDs to restrict search (one per line)
+    #[arg(long)]
+    seqidlist: Option<PathBuf>,
+    /// File of sequence IDs to EXCLUDE from search (one per line)
+    #[arg(long)]
+    negative_seqidlist: Option<PathBuf>,
+    /// X-dropoff for ungapped extensions
+    #[arg(long = "xdrop_ungap")]
+    xdrop_ungap: Option<i32>,
+    /// X-dropoff for preliminary gapped extensions
+    #[arg(long = "xdrop_gap")]
+    xdrop_gap: Option<i32>,
+    /// X-dropoff for final gapped extensions
+    #[arg(long = "xdrop_gap_final")]
+    xdrop_gap_final: Option<i32>,
+    /// Soft masking (use masking for lookup table only, not extensions)
+    #[arg(long = "soft_masking")]
+    soft_masking: bool,
+    /// Number of one-line descriptions to show
+    #[arg(long = "num_descriptions")]
+    num_descriptions: Option<usize>,
+    /// Number of alignments to show
+    #[arg(long = "num_alignments")]
+    num_alignments: Option<usize>,
+    /// Parse deflines in query input
+    #[arg(long = "lcase_masking")]
+    lcase_masking: bool,
+    /// Word score threshold for protein lookup table
+    #[arg(long = "threshold")]
+    threshold: Option<i32>,
+    /// Window size for 2-hit algorithm
+    #[arg(long = "window_size")]
+    window_size: Option<usize>,
 }
 
 #[derive(clap::Args)]
@@ -151,6 +210,40 @@ struct PsiblastArgs {
     /// Number of threads (0 = all)
     #[arg(long = "num_threads", default_value = "0")]
     num_threads: usize,
+    /// Save PSSM checkpoint file (binary)
+    #[arg(long = "out_pssm")]
+    out_pssm: Option<PathBuf>,
+    /// Save ASCII PSSM file
+    #[arg(long = "out_ascii_pssm")]
+    out_ascii_pssm: Option<PathBuf>,
+    /// Load PSSM checkpoint file to use instead of query
+    #[arg(long = "in_pssm")]
+    in_pssm: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct BlastdbcmdArgs {
+    /// Database path (without extension)
+    #[arg(short, long)]
+    db: PathBuf,
+    /// Accession or sequence identifier to retrieve
+    #[arg(long)]
+    entry: Option<String>,
+    /// File of accessions to retrieve (one per line)
+    #[arg(long)]
+    entry_batch: Option<PathBuf>,
+    /// Output file (default: stdout)
+    #[arg(short, long)]
+    out: Option<PathBuf>,
+    /// Show database info
+    #[arg(long)]
+    info: bool,
+    /// Output format: fasta (default), accession
+    #[arg(long = "outfmt", default_value = "fasta")]
+    outfmt: String,
+    /// Range of sequence to extract (e.g. "10-50")
+    #[arg(long)]
+    range: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -183,7 +276,142 @@ fn main() {
         Commands::Psiblast(args)    => run_psiblast(args),
         Commands::Dumpdb(args)      => run_dumpdb(args),
         Commands::Makeblastdb(args) => run_makeblastdb(args),
+        Commands::Blastdbcmd(args)  => run_blastdbcmd(args),
     }
+}
+
+fn apply_task_preset(params: &mut SearchParams, task: &str, program: &str) {
+    match (program, task) {
+        // blastn presets
+        ("blastn", "megablast") => {
+            params.word_size = 28;
+            params.two_hit = false;
+        }
+        ("blastn", "dc-megablast") => {
+            params.word_size = 11;
+        }
+        ("blastn", "blastn-short") => {
+            params.word_size = 7;
+            params.match_score = 1;
+            params.mismatch = -3;
+            params.evalue_threshold = 1000.0;
+        }
+        // blastp presets
+        ("blastp", "blastp-short") => {
+            params.word_size = 2;
+            params.evalue_threshold = 20000.0;
+            params.comp_adjust = false;
+        }
+        ("blastp", "blastp-fast") => {
+            params.word_size = 6;
+        }
+        // blastx presets
+        ("blastx", "blastx-fast") => {
+            params.word_size = 6;
+        }
+        // tblastn presets
+        ("tblastn", "tblastn-fast") => {
+            params.word_size = 6;
+        }
+        _ => {
+            eprintln!("Warning: unknown task '{}' for program '{}', using defaults", task, program);
+        }
+    }
+}
+
+fn build_oid_filter(db: &BlastDb, args: &BlastArgs) -> Option<std::collections::HashSet<u32>> {
+    use std::collections::HashSet;
+
+    // Collect taxid filter
+    let tax_filter: Option<HashSet<u32>> = if let Some(ref taxids_str) = args.taxids {
+        Some(taxids_str.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+    } else if let Some(ref taxid_file) = args.taxidlist {
+        let content = fs::read_to_string(taxid_file).unwrap_or_else(|e| {
+            eprintln!("Error reading taxidlist: {}", e);
+            std::process::exit(1);
+        });
+        Some(content.lines().filter_map(|l| l.trim().parse().ok()).collect())
+    } else {
+        None
+    };
+
+    // Collect seqid filter
+    let seqid_filter: Option<HashSet<String>> = if let Some(ref seqid_file) = args.seqidlist {
+        let content = fs::read_to_string(seqid_file).unwrap_or_else(|e| {
+            eprintln!("Error reading seqidlist: {}", e);
+            std::process::exit(1);
+        });
+        Some(content.lines().filter(|l| !l.trim().is_empty()).map(|l| l.trim().to_string()).collect())
+    } else {
+        None
+    };
+
+    // Collect negative seqid filter
+    let neg_seqid_filter: Option<HashSet<String>> = if let Some(ref neg_file) = args.negative_seqidlist {
+        let content = fs::read_to_string(neg_file).unwrap_or_else(|e| {
+            eprintln!("Error reading negative_seqidlist: {}", e);
+            std::process::exit(1);
+        });
+        Some(content.lines().filter(|l| !l.trim().is_empty()).map(|l| l.trim().to_string()).collect())
+    } else {
+        None
+    };
+
+    if tax_filter.is_none() && seqid_filter.is_none() && neg_seqid_filter.is_none() {
+        return None;
+    }
+
+    let mut allowed_oids = HashSet::new();
+    let total = db.num_sequences();
+
+    for oid in 0..total {
+        let mut include = true;
+
+        // Tax filter
+        if let Some(ref taxids) = tax_filter {
+            if let Some(Ok(oid_taxids)) = db.get_taxids(oid) {
+                if !oid_taxids.iter().any(|t| *t >= 0 && taxids.contains(&(*t as u32))) {
+                    include = false;
+                }
+            } else if let Ok(header) = db.get_header(oid) {
+                if !taxids.contains(&header.taxid) {
+                    include = false;
+                }
+            } else {
+                include = false;
+            }
+        }
+
+        // Seqid filter (positive)
+        if include {
+            if let Some(ref seqids) = seqid_filter {
+                if let Ok(header) = db.get_header(oid) {
+                    if !seqids.contains(&header.accession) {
+                        include = false;
+                    }
+                } else {
+                    include = false;
+                }
+            }
+        }
+
+        // Negative seqid filter
+        if include {
+            if let Some(ref neg_seqids) = neg_seqid_filter {
+                if let Ok(header) = db.get_header(oid) {
+                    if neg_seqids.contains(&header.accession) {
+                        include = false;
+                    }
+                }
+            }
+        }
+
+        if include {
+            allowed_oids.insert(oid);
+        }
+    }
+
+    Some(allowed_oids)
 }
 
 fn run_blastp(args: &BlastArgs) {
@@ -210,6 +438,9 @@ fn run_blastp(args: &BlastArgs) {
     });
 
     let mut params = SearchParams::blastp_defaults();
+    if let Some(ref task) = args.task {
+        apply_task_preset(&mut params, task, "blastp");
+    }
     params.matrix = matrix;
     params.evalue_threshold = args.evalue;
     params.max_target_seqs = args.max_target_seqs;
@@ -218,6 +449,17 @@ fn run_blastp(args: &BlastArgs) {
     if let Some(go) = args.gap_open { params.gap_open = go; }
     if let Some(ge) = args.gap_extend { params.gap_extend = ge; }
     if let Some(ws) = args.word_size { params.word_size = ws; }
+    params.strand = args.strand.clone();
+    params.query_gencode = args.query_gencode;
+    params.db_gencode = args.db_gencode;
+    params.max_hsps = args.max_hsps;
+    params.culling_limit = args.culling_limit;
+    if let Some(xu) = args.xdrop_ungap { params.x_drop_ungapped = xu; }
+    if let Some(xg) = args.xdrop_gap { params.x_drop_gapped = xg; }
+    if let Some(xf) = args.xdrop_gap_final { params.x_drop_final = xf; }
+    if let Some(ws) = args.window_size { params.two_hit_window = ws; }
+    // params.soft_masking = args.soft_masking;  // TODO: add to SearchParams
+    // params.lcase_masking = args.lcase_masking;  // TODO: add to SearchParams
 
     let queries = read_fasta(&args.query).unwrap_or_else(|e| {
         eprintln!("Error reading query: {}", e);
@@ -242,8 +484,13 @@ fn run_blastp(args: &BlastArgs) {
         output::write_json_header(&mut out).unwrap();
     }
 
+    let filter = build_oid_filter(&db, args);
+
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        let results = api_blastp(&db, query_seq, &params);
+        let mut results = api_blastp(&db, query_seq, &params);
+        if let Some(ref f) = filter {
+            results.retain(|r| f.contains(&r.subject_oid));
+        }
 
         let ctx = output::SearchContext {
             program: "blastp",
@@ -259,6 +506,8 @@ fn run_blastp(args: &BlastArgs) {
             gap_extend: params.gap_extend,
             evalue_threshold: args.evalue,
             iter_num: iter_num + 1,
+            num_descriptions: None,
+            num_alignments: None,
         };
 
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
@@ -290,6 +539,9 @@ fn run_blastn(args: &BlastArgs) {
     });
 
     let mut params = SearchParams::blastn_defaults();
+    if let Some(ref task) = args.task {
+        apply_task_preset(&mut params, task, "blastn");
+    }
     params.evalue_threshold = args.evalue;
     params.max_target_seqs = args.max_target_seqs;
     params.match_score = args.match_score;
@@ -299,6 +551,17 @@ fn run_blastn(args: &BlastArgs) {
     if let Some(go) = args.gap_open { params.gap_open = go; }
     if let Some(ge) = args.gap_extend { params.gap_extend = ge; }
     if let Some(ws) = args.word_size { params.word_size = ws; }
+    params.strand = args.strand.clone();
+    params.query_gencode = args.query_gencode;
+    params.db_gencode = args.db_gencode;
+    params.max_hsps = args.max_hsps;
+    params.culling_limit = args.culling_limit;
+    if let Some(xu) = args.xdrop_ungap { params.x_drop_ungapped = xu; }
+    if let Some(xg) = args.xdrop_gap { params.x_drop_gapped = xg; }
+    if let Some(xf) = args.xdrop_gap_final { params.x_drop_final = xf; }
+    if let Some(ws) = args.window_size { params.two_hit_window = ws; }
+    // params.soft_masking = args.soft_masking;  // TODO: add to SearchParams
+    // params.lcase_masking = args.lcase_masking;  // TODO: add to SearchParams
 
     let queries = read_fasta(&args.query).unwrap_or_else(|e| {
         eprintln!("Error reading query: {}", e);
@@ -322,8 +585,13 @@ fn run_blastn(args: &BlastArgs) {
         output::write_json_header(&mut out).unwrap();
     }
 
+    let filter = build_oid_filter(&db, args);
+
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        let results = api_blastn(&db, query_seq, &params);
+        let mut results = api_blastn(&db, query_seq, &params);
+        if let Some(ref f) = filter {
+            results.retain(|r| f.contains(&r.subject_oid));
+        }
 
         let ctx = output::SearchContext {
             program: "blastn",
@@ -339,6 +607,8 @@ fn run_blastn(args: &BlastArgs) {
             gap_extend: params.gap_extend,
             evalue_threshold: args.evalue,
             iter_num: iter_num + 1,
+            num_descriptions: None,
+            num_alignments: None,
         };
 
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
@@ -396,6 +666,9 @@ fn run_blastx(args: &BlastArgs) {
 
     let fmt = parse_fmt(&args.outfmt);
     let mut params = SearchParams::blastx_defaults();
+    if let Some(ref task) = args.task {
+        apply_task_preset(&mut params, task, "blastx");
+    }
     params.evalue_threshold = args.evalue;
     params.max_target_seqs = args.max_target_seqs;
     params.filter_low_complexity = !args.no_lc_filter;
@@ -403,6 +676,17 @@ fn run_blastx(args: &BlastArgs) {
     if let Some(go) = args.gap_open  { params.gap_open = go; }
     if let Some(ge) = args.gap_extend { params.gap_extend = ge; }
     if let Some(ws) = args.word_size  { params.word_size = ws; }
+    params.strand = args.strand.clone();
+    params.query_gencode = args.query_gencode;
+    params.db_gencode = args.db_gencode;
+    params.max_hsps = args.max_hsps;
+    params.culling_limit = args.culling_limit;
+    if let Some(xu) = args.xdrop_ungap { params.x_drop_ungapped = xu; }
+    if let Some(xg) = args.xdrop_gap { params.x_drop_gapped = xg; }
+    if let Some(xf) = args.xdrop_gap_final { params.x_drop_final = xf; }
+    if let Some(ws) = args.window_size { params.two_hit_window = ws; }
+    // params.soft_masking = args.soft_masking;  // TODO: add to SearchParams
+    // params.lcase_masking = args.lcase_masking;  // TODO: add to SearchParams
 
     let queries = read_fasta(&args.query).unwrap_or_else(|e| {
         eprintln!("Error reading query: {}", e);
@@ -418,14 +702,20 @@ fn run_blastx(args: &BlastArgs) {
     if fmt.fmt_id == 5 { output::write_xml_header(&mut out, "blastx", &db_path, "blast-cli 0.1.0").unwrap(); }
     else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
 
+    let filter = build_oid_filter(&db, args);
+
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        let results = api_blastx(&db, query_seq, &params);
+        let mut results = api_blastx(&db, query_seq, &params);
+        if let Some(ref f) = filter {
+            results.retain(|r| f.contains(&r.subject_oid));
+        }
         let ctx = output::SearchContext {
             program: "blastx", db_path: &db_path, db_title: &db_title,
             db_num_seqs, db_len, query_title,
             query_seq, query_len: query_seq.len(),
             matrix: "N/A", gap_open: params.gap_open, gap_extend: params.gap_extend,
             evalue_threshold: args.evalue, iter_num: iter_num + 1,
+            num_descriptions: None, num_alignments: None,
         };
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
     }
@@ -443,6 +733,9 @@ fn run_tblastn(args: &BlastArgs) {
     let matrix = parse_matrix(&args.matrix);
     let fmt = parse_fmt(&args.outfmt);
     let mut params = SearchParams::tblastn_defaults();
+    if let Some(ref task) = args.task {
+        apply_task_preset(&mut params, task, "tblastn");
+    }
     params.matrix = matrix;
     params.evalue_threshold = args.evalue;
     params.max_target_seqs = args.max_target_seqs;
@@ -451,6 +744,17 @@ fn run_tblastn(args: &BlastArgs) {
     if let Some(go) = args.gap_open   { params.gap_open = go; }
     if let Some(ge) = args.gap_extend { params.gap_extend = ge; }
     if let Some(ws) = args.word_size  { params.word_size = ws; }
+    params.strand = args.strand.clone();
+    params.query_gencode = args.query_gencode;
+    params.db_gencode = args.db_gencode;
+    params.max_hsps = args.max_hsps;
+    params.culling_limit = args.culling_limit;
+    if let Some(xu) = args.xdrop_ungap { params.x_drop_ungapped = xu; }
+    if let Some(xg) = args.xdrop_gap { params.x_drop_gapped = xg; }
+    if let Some(xf) = args.xdrop_gap_final { params.x_drop_final = xf; }
+    if let Some(ws) = args.window_size { params.two_hit_window = ws; }
+    // params.soft_masking = args.soft_masking;  // TODO: add to SearchParams
+    // params.lcase_masking = args.lcase_masking;  // TODO: add to SearchParams
 
     let queries = read_fasta(&args.query).unwrap_or_else(|e| {
         eprintln!("Error reading query: {}", e);
@@ -467,14 +771,20 @@ fn run_tblastn(args: &BlastArgs) {
     if fmt.fmt_id == 5 { output::write_xml_header(&mut out, "tblastn", &db_path, "blast-cli 0.1.0").unwrap(); }
     else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
 
+    let filter = build_oid_filter(&db, args);
+
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        let results = api_tblastn(&db, query_seq, &params);
+        let mut results = api_tblastn(&db, query_seq, &params);
+        if let Some(ref f) = filter {
+            results.retain(|r| f.contains(&r.subject_oid));
+        }
         let ctx = output::SearchContext {
             program: "tblastn", db_path: &db_path, db_title: &db_title,
             db_num_seqs, db_len, query_title,
             query_seq, query_len: query_seq.len(),
             matrix: matrix_name, gap_open: params.gap_open, gap_extend: params.gap_extend,
             evalue_threshold: args.evalue, iter_num: iter_num + 1,
+            num_descriptions: None, num_alignments: None,
         };
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
     }
@@ -491,11 +801,25 @@ fn run_tblastx(args: &BlastArgs) {
 
     let fmt = parse_fmt(&args.outfmt);
     let mut params = SearchParams::tblastx_defaults();
+    if let Some(ref task) = args.task {
+        apply_task_preset(&mut params, task, "tblastx");
+    }
     params.evalue_threshold = args.evalue;
     params.max_target_seqs = args.max_target_seqs;
     params.filter_low_complexity = !args.no_lc_filter;
     params.comp_adjust = !args.no_comp_adjust;
     if let Some(ws) = args.word_size { params.word_size = ws; }
+    params.strand = args.strand.clone();
+    params.query_gencode = args.query_gencode;
+    params.db_gencode = args.db_gencode;
+    params.max_hsps = args.max_hsps;
+    params.culling_limit = args.culling_limit;
+    if let Some(xu) = args.xdrop_ungap { params.x_drop_ungapped = xu; }
+    if let Some(xg) = args.xdrop_gap { params.x_drop_gapped = xg; }
+    if let Some(xf) = args.xdrop_gap_final { params.x_drop_final = xf; }
+    if let Some(ws) = args.window_size { params.two_hit_window = ws; }
+    // params.soft_masking = args.soft_masking;  // TODO: add to SearchParams
+    // params.lcase_masking = args.lcase_masking;  // TODO: add to SearchParams
 
     let queries = read_fasta(&args.query).unwrap_or_else(|e| {
         eprintln!("Error reading query: {}", e);
@@ -511,14 +835,20 @@ fn run_tblastx(args: &BlastArgs) {
     if fmt.fmt_id == 5 { output::write_xml_header(&mut out, "tblastx", &db_path, "blast-cli 0.1.0").unwrap(); }
     else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
 
+    let filter = build_oid_filter(&db, args);
+
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        let results = api_tblastx(&db, query_seq, &params);
+        let mut results = api_tblastx(&db, query_seq, &params);
+        if let Some(ref f) = filter {
+            results.retain(|r| f.contains(&r.subject_oid));
+        }
         let ctx = output::SearchContext {
             program: "tblastx", db_path: &db_path, db_title: &db_title,
             db_num_seqs, db_len, query_title,
             query_seq, query_len: query_seq.len(),
             matrix: "N/A", gap_open: params.gap_open, gap_extend: params.gap_extend,
             evalue_threshold: args.evalue, iter_num: iter_num + 1,
+            num_descriptions: None, num_alignments: None,
         };
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
     }
@@ -562,15 +892,37 @@ fn run_psiblast(args: &PsiblastArgs) {
         .inclusion_evalue(args.inclusion_ethresh);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        let (results, _pssm) = api_psiblast(&db, query_seq, &psi_params);
+        let (results, pssm) = api_psiblast(&db, query_seq, &psi_params);
         let ctx = output::SearchContext {
             program: "psiblast", db_path: &db_path, db_title: &db_title,
             db_num_seqs, db_len, query_title,
             query_seq, query_len: query_seq.len(),
             matrix: matrix_name, gap_open: params.gap_open, gap_extend: params.gap_extend,
             evalue_threshold: args.evalue, iter_num: iter_num + 1,
+            num_descriptions: None, num_alignments: None,
         };
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
+
+        // Save PSSM checkpoint if requested
+        if let Some(ref pssm_path) = args.out_pssm {
+            let mut f = fs::File::create(pssm_path).unwrap_or_else(|e| {
+                eprintln!("Error creating PSSM file: {}", e);
+                std::process::exit(1);
+            });
+            pssm.write_checkpoint(&mut f).unwrap();
+            eprintln!("PSSM checkpoint saved to {}", pssm_path.display());
+        }
+
+        // Save ASCII PSSM if requested
+        if let Some(ref ascii_path) = args.out_ascii_pssm {
+            let ncbi_query = blast_core::search::aa_to_ncbistdaa(query_seq);
+            let mut f = fs::File::create(ascii_path).unwrap_or_else(|e| {
+                eprintln!("Error creating ASCII PSSM file: {}", e);
+                std::process::exit(1);
+            });
+            pssm.write_ascii(&mut f, &ncbi_query).unwrap();
+            eprintln!("ASCII PSSM saved to {}", ascii_path.display());
+        }
     }
 
     if fmt.fmt_id == 5 { output::write_xml_footer(&mut out).unwrap(); }
@@ -728,6 +1080,115 @@ fn run_dumpdb(args: &DumpArgs) {
 }
 
 // ---- FASTA reader ----
+
+fn run_blastdbcmd(args: &BlastdbcmdArgs) {
+    let db = open_db(&args.db);
+    let stdout = io::stdout();
+    let out: Box<dyn Write> = match &args.out {
+        Some(p) => Box::new(fs::File::create(p).unwrap()),
+        None => Box::new(stdout.lock()),
+    };
+    let mut out = io::BufWriter::new(out);
+
+    if args.info {
+        writeln!(out, "Database: {}", args.db.display()).unwrap();
+        writeln!(out, "  {} sequences; {} total letters", db.num_sequences(), db.volume_length()).unwrap();
+        writeln!(out, "  Title: {}", db.title()).unwrap();
+        writeln!(out, "  Type: {}", if db.seq_type() == SeqType::Protein { "Protein" } else { "Nucleotide" }).unwrap();
+        writeln!(out, "  Format version: {}", db.format_version()).unwrap();
+        writeln!(out, "  Volumes: {}", db.num_volumes()).unwrap();
+        return;
+    }
+
+    let accessions: Vec<String> = if let Some(ref entry) = args.entry {
+        entry.split(',').map(|s| s.trim().to_string()).collect()
+    } else if let Some(ref batch_path) = args.entry_batch {
+        let content = fs::read_to_string(batch_path).unwrap_or_else(|e| {
+            eprintln!("Error reading entry batch file: {}", e);
+            std::process::exit(1);
+        });
+        content.lines().filter(|l| !l.trim().is_empty()).map(|l| l.trim().to_string()).collect()
+    } else {
+        eprintln!("Error: specify --entry or --entry_batch or --info");
+        std::process::exit(1);
+    };
+
+    let range = args.range.as_ref().and_then(|r| {
+        let parts: Vec<&str> = r.split('-').collect();
+        if parts.len() == 2 {
+            let start: usize = parts[0].parse().ok()?;
+            let end: usize = parts[1].parse().ok()?;
+            Some((start.saturating_sub(1), end)) // convert 1-based to 0-based
+        } else {
+            None
+        }
+    });
+
+    for acc in &accessions {
+        // Try accession lookup (v5) first, then scan headers
+        let oid = if let Some(result) = db.lookup_accession(acc) {
+            match result {
+                Ok(oids) if !oids.is_empty() => Some(oids[0]),
+                _ => None,
+            }
+        } else {
+            // Linear scan for v4 databases
+            let mut found = None;
+            for oid in 0..db.num_sequences() {
+                if let Ok(header) = db.get_header(oid) {
+                    if header.accession == *acc {
+                        found = Some(oid);
+                        break;
+                    }
+                }
+            }
+            found
+        };
+
+        let oid = match oid {
+            Some(o) => o,
+            None => {
+                eprintln!("Accession '{}' not found.", acc);
+                continue;
+            }
+        };
+
+        if args.outfmt == "accession" {
+            let header = db.get_header(oid).unwrap_or_default();
+            writeln!(out, "{}", header.accession).unwrap();
+            continue;
+        }
+
+        // FASTA output (default)
+        let header = db.get_header(oid).unwrap_or_default();
+        let title = if header.title.is_empty() { acc.clone() } else { header.title };
+
+        match db.seq_type() {
+            SeqType::Protein => {
+                let seq = db.get_sequence_protein(oid).unwrap_or_default();
+                let seq = if let Some((start, end)) = range {
+                    seq[start..end.min(seq.len())].to_vec()
+                } else { seq };
+                writeln!(out, ">{} {}", header.accession, title).unwrap();
+                for chunk in seq.chunks(60) {
+                    out.write_all(chunk).unwrap();
+                    writeln!(out).unwrap();
+                }
+            }
+            SeqType::Nucleotide => {
+                let seq = db.get_sequence_nucleotide(oid).unwrap_or_default();
+                let seq = if let Some((start, end)) = range {
+                    seq[start..end.min(seq.len())].to_vec()
+                } else { seq };
+                writeln!(out, ">{} {}", header.accession, title).unwrap();
+                for chunk in seq.chunks(60) {
+                    out.write_all(chunk).unwrap();
+                    writeln!(out).unwrap();
+                }
+            }
+        }
+    }
+}
 
 fn read_fasta(path: &Path) -> io::Result<Vec<(String, Vec<u8>)>> {
     let file = fs::File::open(path)?;

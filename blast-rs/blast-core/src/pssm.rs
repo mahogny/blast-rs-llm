@@ -361,3 +361,82 @@ pub fn psiblast_search(
 
     (results, pssm)
 }
+
+// ─── PSSM checkpoint save/load ──────────────────────────────────────────────
+
+/// Ncbistdaa code to ASCII
+fn ncbistdaa_to_ascii(code: u8) -> char {
+    match code {
+        1 => 'A', 2 => 'B', 3 => 'C', 4 => 'D', 5 => 'E', 6 => 'F', 7 => 'G',
+        8 => 'H', 9 => 'I', 10 => 'K', 11 => 'L', 12 => 'M', 13 => 'N', 14 => 'P',
+        15 => 'Q', 16 => 'R', 17 => 'S', 18 => 'T', 19 => 'V', 20 => 'W',
+        21 => 'X', 22 => 'Y', 23 => 'Z', 25 => '*', _ => 'X',
+    }
+}
+
+impl Pssm {
+    /// Write the PSSM in ASCII format compatible with NCBI's `-out_ascii_pssm` output.
+    pub fn write_ascii<W: std::io::Write>(&self, out: &mut W, query: &[u8]) -> std::io::Result<()> {
+        // Header line with residue codes
+        let aa_order: &[u8] = &[1,16,13,4,3,15,5,7,8,9,11,10,12,6,14,17,18,20,22,19,2,23,21,25];
+        write!(out, "       ")?;
+        for &code in aa_order {
+            write!(out, " {:>4}", ncbistdaa_to_ascii(code))?;
+        }
+        writeln!(out)?;
+
+        for i in 0..self.query_len {
+            let aa = if i < query.len() {
+                ncbistdaa_to_ascii(query[i])
+            } else { 'X' };
+            write!(out, "{:>5} {}", i + 1, aa)?;
+            for &code in aa_order {
+                write!(out, " {:>4}", self.scores[i][code as usize])?;
+            }
+            writeln!(out)?;
+        }
+        writeln!(out)?;
+        writeln!(out, "Lambda: {:.4}", self.lambda)?;
+        Ok(())
+    }
+
+    /// Write binary PSSM checkpoint (simple format: query_len, lambda, then scores).
+    pub fn write_checkpoint<W: std::io::Write>(&self, out: &mut W) -> std::io::Result<()> {
+        use std::io::Write;
+        let len_bytes = (self.query_len as u32).to_le_bytes();
+        out.write_all(&len_bytes)?;
+        let lambda_bytes = self.lambda.to_le_bytes();
+        out.write_all(&lambda_bytes)?;
+        for row in &self.scores {
+            for &val in row.iter() {
+                out.write_all(&val.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read binary PSSM checkpoint.
+    pub fn read_checkpoint<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        use std::io::Read;
+        let mut buf4 = [0u8; 4];
+        let mut buf8 = [0u8; 8];
+
+        reader.read_exact(&mut buf4)?;
+        let query_len = u32::from_le_bytes(buf4) as usize;
+
+        reader.read_exact(&mut buf8)?;
+        let lambda = f64::from_le_bytes(buf8);
+
+        let mut scores = Vec::with_capacity(query_len);
+        for _ in 0..query_len {
+            let mut row = [0i32; 28];
+            for j in 0..28 {
+                reader.read_exact(&mut buf4)?;
+                row[j] = i32::from_le_bytes(buf4);
+            }
+            scores.push(row);
+        }
+
+        Ok(Pssm { query_len, scores, lambda })
+    }
+}

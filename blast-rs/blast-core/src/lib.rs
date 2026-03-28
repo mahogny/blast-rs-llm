@@ -16,10 +16,10 @@ pub use matrix::{ScoringMatrix, MatrixType};
 pub use stats::KarlinAltschul;
 pub use hsp::{Hsp, SearchResult};
 pub use search::{SearchParams, blast_search};
-pub use translate::{six_frame_translate, reverse_complement, TranslatedFrame};
+pub use translate::{six_frame_translate, six_frame_translate_with_code, reverse_complement, TranslatedFrame, get_codon_table};
 pub use mask::{apply_dust, apply_seg, apply_seg_ncbistdaa};
 pub use pssm::{Pssm, build_pssm, psiblast_search, search_with_pssm};
-pub use compo::{composition_ncbistdaa, adjust_evalue, BACKGROUND_FREQ};
+pub use compo::{composition_ncbistdaa, adjust_evalue, adjust_evalue_with_mode, BACKGROUND_FREQ};
 
 // Top-level API functions
 pub use api::{blastp, blastn, blastx, tblastn, tblastx, psiblast, PsiblastParams, parse_fasta};

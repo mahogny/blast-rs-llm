@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::fs;
 use memmap2::Mmap;
 use crate::error::{DbError, Result};
@@ -9,25 +9,31 @@ use crate::lmdb_v5::LmdbV5;
 use crate::oid_seqids::OidSeqIds;
 use crate::oid_taxids::OidTaxIds;
 
-pub struct BlastDb {
-    pub(crate) index: IndexFile,
-    /// Memory-mapped sequence file (.psq or .nsq)
+/// A single BLAST database volume.
+struct Volume {
+    index: IndexFile,
     seq_mmap: Mmap,
-    /// Memory-mapped header file (.phr or .nhr)
     hdr_mmap: Mmap,
-    /// V5 LMDB accession index (.pdb or .ndb) — None for v4 databases.
     lmdb: Option<LmdbV5>,
-    /// V5 OID→SeqIds file (.pos or .nos) — None for v4 databases.
     oid_seqids: Option<OidSeqIds>,
-    /// V5 OID→TaxIds file (.pot or .not) — None for v4 databases.
     oid_taxids: Option<OidTaxIds>,
 }
 
+pub struct BlastDb {
+    volumes: Vec<Volume>,
+    /// Cumulative OID count per volume: volume i covers OIDs [cum_oids[i], cum_oids[i+1]).
+    cum_oids: Vec<u32>,
+    /// Cached metadata from first volume / alias
+    title_str: String,
+    total_seqs: u32,
+    total_length: u64,
+    db_seq_type: SeqType,
+    db_format_version: i32,
+}
+
 impl BlastDb {
-    /// Open a BLAST database by base path (without extension).
-    /// Auto-detects protein vs nucleotide and v4 vs v5.
-    pub fn open(path: &Path) -> Result<Self> {
-        // Detect type by which index file exists.
+    /// Open a single volume from a base path (without extension).
+    fn open_single_volume(path: &Path) -> Result<Volume> {
         let (is_protein, index_ext, seq_ext, hdr_ext) = if path.with_extension("pin").exists() {
             (true, "pin", "psq", "phr")
         } else if path.with_extension("nin").exists() {
@@ -48,7 +54,6 @@ impl BlastDb {
         let hdr_file = fs::File::open(path.with_extension(hdr_ext))?;
         let hdr_mmap = unsafe { Mmap::map(&hdr_file)? };
 
-        // V5: try to open LMDB and auxiliary files (gracefully absent = v4).
         let (lmdb, oid_seqids, oid_taxids) = if index.format_version == 5 {
             let (lmdb_ext, seqids_ext, taxids_ext) =
                 if is_protein { ("pdb", "pos", "pot") }
@@ -57,160 +62,290 @@ impl BlastDb {
             let lmdb_path = path.with_extension(lmdb_ext);
             let lmdb = if lmdb_path.exists() {
                 Some(LmdbV5::open(&lmdb_path)?)
-            } else {
-                None
-            };
+            } else { None };
 
             let oid_seqids_path = path.with_extension(seqids_ext);
             let oid_seqids = if oid_seqids_path.exists() {
                 Some(OidSeqIds::open(&oid_seqids_path)?)
-            } else {
-                None
-            };
+            } else { None };
 
             let oid_taxids_path = path.with_extension(taxids_ext);
             let oid_taxids = if oid_taxids_path.exists() {
                 Some(OidTaxIds::open(&oid_taxids_path)?)
-            } else {
-                None
-            };
+            } else { None };
 
             (lmdb, oid_seqids, oid_taxids)
         } else {
             (None, None, None)
         };
 
-        Ok(BlastDb { index, seq_mmap, hdr_mmap, lmdb, oid_seqids, oid_taxids })
+        Ok(Volume { index, seq_mmap, hdr_mmap, lmdb, oid_seqids, oid_taxids })
+    }
+
+    /// Parse a BLAST alias file (.pal or .nal) and return volume paths.
+    fn parse_alias_file(alias_path: &Path) -> Result<(Option<String>, Vec<PathBuf>)> {
+        let content = fs::read_to_string(alias_path)?;
+        let parent = alias_path.parent().unwrap_or(Path::new("."));
+        let mut title = None;
+        let mut db_list = Vec::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') { continue; }
+            if let Some(val) = line.strip_prefix("TITLE ") {
+                title = Some(val.trim().to_string());
+            } else if let Some(val) = line.strip_prefix("DBLIST ") {
+                for name in val.split_whitespace() {
+                    let name = name.trim_matches('"');
+                    let vol_path = if Path::new(name).is_absolute() {
+                        PathBuf::from(name)
+                    } else {
+                        parent.join(name)
+                    };
+                    db_list.push(vol_path);
+                }
+            }
+        }
+
+        if db_list.is_empty() {
+            return Err(DbError::InvalidFormat("Alias file has no DBLIST".into()));
+        }
+        Ok((title, db_list))
+    }
+
+    /// Open a BLAST database by base path (without extension).
+    /// Supports single volumes, multi-volume databases, and alias files (.pal/.nal).
+    pub fn open(path: &Path) -> Result<Self> {
+        // Check for alias files first
+        let pal = path.with_extension("pal");
+        let nal = path.with_extension("nal");
+
+        if pal.exists() || nal.exists() {
+            let alias_path = if pal.exists() { pal } else { nal };
+            let (alias_title, vol_paths) = Self::parse_alias_file(&alias_path)?;
+
+            let mut volumes = Vec::new();
+            for vp in &vol_paths {
+                volumes.push(Self::open_single_volume(vp)?);
+            }
+            return Self::from_volumes(volumes, alias_title);
+        }
+
+        // Check for multi-volume: path.00.pin, path.01.pin, etc.
+        let mut vol_paths = Vec::new();
+        for i in 0..1000u32 {
+            let vol_base = PathBuf::from(format!("{}.{:02}", path.display(), i));
+            if vol_base.with_extension("pin").exists() || vol_base.with_extension("nin").exists() {
+                vol_paths.push(vol_base);
+            } else {
+                break;
+            }
+        }
+
+        if vol_paths.len() > 1 {
+            let mut volumes = Vec::new();
+            for vp in &vol_paths {
+                volumes.push(Self::open_single_volume(vp)?);
+            }
+            return Self::from_volumes(volumes, None);
+        }
+
+        // Single volume
+        let vol = Self::open_single_volume(path)?;
+        Self::from_volumes(vec![vol], None)
+    }
+
+    fn from_volumes(volumes: Vec<Volume>, alias_title: Option<String>) -> Result<Self> {
+        if volumes.is_empty() {
+            return Err(DbError::InvalidFormat("No volumes found".into()));
+        }
+
+        let db_seq_type = volumes[0].index.seq_type;
+        let db_format_version = volumes[0].index.format_version;
+
+        let mut cum_oids = vec![0u32];
+        let mut total_length = 0u64;
+        let mut total_seqs = 0u32;
+
+        for vol in &volumes {
+            total_seqs += vol.index.num_oids;
+            total_length += vol.index.volume_length;
+            cum_oids.push(total_seqs);
+        }
+
+        let title_str = alias_title.unwrap_or_else(|| {
+            volumes.iter().map(|v| v.index.title.as_str()).collect::<Vec<_>>().join("; ")
+        });
+
+        Ok(BlastDb {
+            volumes,
+            cum_oids,
+            title_str,
+            total_seqs,
+            total_length,
+            db_seq_type,
+            db_format_version,
+        })
+    }
+
+    /// Resolve a global OID to (volume_index, local_oid).
+    #[inline]
+    fn resolve_oid(&self, oid: u32) -> Result<(usize, u32)> {
+        if oid >= self.total_seqs {
+            return Err(DbError::OidOutOfRange(oid));
+        }
+        // Binary search for the right volume
+        let mut lo = 0;
+        let mut hi = self.volumes.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if oid < self.cum_oids[mid + 1] {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        let local_oid = oid - self.cum_oids[lo];
+        Ok((lo, local_oid))
     }
 
     // ---- Metadata ----
 
     pub fn num_sequences(&self) -> u32 {
-        self.index.num_oids
+        self.total_seqs
     }
 
     pub fn seq_type(&self) -> SeqType {
-        self.index.seq_type
+        self.db_seq_type
     }
 
     pub fn volume_length(&self) -> u64 {
-        self.index.volume_length
+        self.total_length
     }
 
     pub fn title(&self) -> &str {
-        &self.index.title
+        &self.title_str
     }
 
-    /// Returns 4 for classic BlastDB, 5 for LMDB-indexed BlastDB.
     pub fn format_version(&self) -> i32 {
-        self.index.format_version
+        self.db_format_version
     }
 
-    /// Returns true if this is a v5 database with an LMDB accession index.
     pub fn is_v5(&self) -> bool {
-        self.index.format_version == 5
+        self.db_format_version == 5
+    }
+
+    /// Number of volumes in this database.
+    pub fn num_volumes(&self) -> usize {
+        self.volumes.len()
     }
 
     // ---- Sequence access ----
 
-    /// Returns raw Ncbistdaa bytes for a protein sequence.
     pub fn get_sequence_protein_raw(&self, oid: u32) -> Result<&[u8]> {
-        self.check_oid(oid)?;
-        let start = self.index.sequence_array[oid as usize] as usize;
-        let end = self.index.sequence_array[oid as usize + 1] as usize;
-        Ok(get_protein_raw(&self.seq_mmap, start, end))
+        let (vi, local) = self.resolve_oid(oid)?;
+        let vol = &self.volumes[vi];
+        let start = vol.index.sequence_array[local as usize] as usize;
+        let end = vol.index.sequence_array[local as usize + 1] as usize;
+        Ok(get_protein_raw(&vol.seq_mmap, start, end))
     }
 
-    /// Returns ASCII amino acid sequence for a protein OID.
     pub fn get_sequence_protein(&self, oid: u32) -> Result<Vec<u8>> {
         Ok(decode_protein(self.get_sequence_protein_raw(oid)?))
     }
 
-    /// Returns decoded ASCII nucleotide sequence for a nucleotide OID.
     pub fn get_sequence_nucleotide(&self, oid: u32) -> Result<Vec<u8>> {
-        self.check_oid(oid)?;
-        let ambig = self.index.ambig_array.as_ref()
+        let (vi, local) = self.resolve_oid(oid)?;
+        let vol = &self.volumes[vi];
+        let ambig = vol.index.ambig_array.as_ref()
             .ok_or_else(|| DbError::InvalidFormat("No ambig_array for nucleotide db".into()))?;
-        let seq_start = self.index.sequence_array[oid as usize] as usize;
-        let seq_end = ambig[oid as usize] as usize;
+        let seq_start = vol.index.sequence_array[local as usize] as usize;
+        let seq_end = ambig[local as usize] as usize;
         let ambig_start = seq_end;
-        let ambig_end = self.index.sequence_array[oid as usize + 1] as usize;
-        Ok(get_nucleotide(&self.seq_mmap, seq_start, seq_end, ambig_start, ambig_end))
+        let ambig_end = vol.index.sequence_array[local as usize + 1] as usize;
+        Ok(get_nucleotide(&vol.seq_mmap, seq_start, seq_end, ambig_start, ambig_end))
     }
 
     // ---- Header access ----
 
-    /// Returns the primary defline for an OID (from the BER-encoded .phr/.nhr file).
     pub fn get_header(&self, oid: u32) -> Result<BlastDefLine> {
-        self.check_oid(oid)?;
-        let start = self.index.header_array[oid as usize] as usize;
-        let end = self.index.header_array[oid as usize + 1] as usize;
-        let data = &self.hdr_mmap[start..end];
+        let (vi, local) = self.resolve_oid(oid)?;
+        let vol = &self.volumes[vi];
+        let start = vol.index.header_array[local as usize] as usize;
+        let end = vol.index.header_array[local as usize + 1] as usize;
+        let data = &vol.hdr_mmap[start..end];
         let deflines = parse_def_line_set(data)?;
         Ok(deflines.into_iter().next().unwrap_or_default())
     }
 
-    /// Returns all deflines for an OID (for non-redundant databases).
     pub fn get_headers(&self, oid: u32) -> Result<Vec<BlastDefLine>> {
-        self.check_oid(oid)?;
-        let start = self.index.header_array[oid as usize] as usize;
-        let end = self.index.header_array[oid as usize + 1] as usize;
-        let data = &self.hdr_mmap[start..end];
+        let (vi, local) = self.resolve_oid(oid)?;
+        let vol = &self.volumes[vi];
+        let start = vol.index.header_array[local as usize] as usize;
+        let end = vol.index.header_array[local as usize + 1] as usize;
+        let data = &vol.hdr_mmap[start..end];
         parse_def_line_set(data)
     }
 
     // ---- V5 accession index ----
 
-    /// Find OID(s) for an accession string using the LMDB index.
-    /// Returns `None` if this is a v4 database (no LMDB index).
-    /// Returns an empty `Vec` if the accession is not found.
     pub fn lookup_accession(&self, accession: &str) -> Option<Result<Vec<u32>>> {
-        let lmdb = self.lmdb.as_ref()?;
-        Some(lmdb.get_oids_for_accession(accession))
+        // Search across all volumes
+        let mut all_oids = Vec::new();
+        let mut found = false;
+        for (vi, vol) in self.volumes.iter().enumerate() {
+            if let Some(ref lmdb) = vol.lmdb {
+                found = true;
+                match lmdb.get_oids_for_accession(accession) {
+                    Ok(oids) => {
+                        let offset = self.cum_oids[vi];
+                        all_oids.extend(oids.iter().map(|&o| o + offset));
+                    }
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+        }
+        if found { Some(Ok(all_oids)) } else { None }
     }
 
-    /// Iterate over all (accession, oid) pairs in the LMDB index.
-    /// Returns `None` if this is a v4 database.
-    pub fn iter_accessions<F>(&self, f: F) -> Option<Result<()>>
+    pub fn iter_accessions<F>(&self, mut f: F) -> Option<Result<()>>
     where
         F: FnMut(&str, u32),
     {
-        let lmdb = self.lmdb.as_ref()?;
-        Some(lmdb.iter_accessions(f))
+        let mut found = false;
+        for (vi, vol) in self.volumes.iter().enumerate() {
+            if let Some(ref lmdb) = vol.lmdb {
+                found = true;
+                let offset = self.cum_oids[vi];
+                let result = lmdb.iter_accessions(|acc, oid| {
+                    f(acc, oid + offset);
+                });
+                if let Err(e) = result { return Some(Err(e)); }
+            }
+        }
+        if found { Some(Ok(())) } else { None }
     }
 
-    /// Get volume name → num_oids information from the LMDB.
-    /// Returns `None` for v4 databases.
     pub fn get_volumes_info(&self) -> Option<Result<Vec<(String, u32)>>> {
-        let lmdb = self.lmdb.as_ref()?;
+        // Try first volume's LMDB
+        let vol = &self.volumes[0];
+        let lmdb = vol.lmdb.as_ref()?;
         Some(lmdb.get_volumes_info())
     }
 
     // ---- V5 OID→SeqIDs ----
 
-    /// Return all seq-id strings for an OID from the `.pos`/`.nos` file.
-    /// Returns `None` if the file is not available (v4 or absent).
     pub fn get_seqids(&self, oid: u32) -> Option<Result<Vec<String>>> {
-        let r = self.oid_seqids.as_ref()?;
-        Some(r.get_seqids(oid))
+        let (vi, local) = self.resolve_oid(oid).ok()?;
+        let r = self.volumes[vi].oid_seqids.as_ref()?;
+        Some(r.get_seqids(local))
     }
 
     // ---- V5 OID→TaxIDs ----
 
-    /// Return all tax IDs for an OID from the `.pot`/`.not` file.
-    /// Returns `None` if the file is not available (v4 or absent).
     pub fn get_taxids(&self, oid: u32) -> Option<Result<Vec<i32>>> {
-        let r = self.oid_taxids.as_ref()?;
-        Some(r.get_taxids(oid))
-    }
-
-    // ---- Internal ----
-
-    fn check_oid(&self, oid: u32) -> Result<()> {
-        if oid >= self.index.num_oids {
-            Err(DbError::OidOutOfRange(oid))
-        } else {
-            Ok(())
-        }
+        let (vi, local) = self.resolve_oid(oid).ok()?;
+        let r = self.volumes[vi].oid_taxids.as_ref()?;
+        Some(r.get_taxids(local))
     }
 }
