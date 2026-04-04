@@ -226,23 +226,35 @@ pub fn blast_search(
 
     let query_comp = if params.comp_adjust { Some(composition_ncbistdaa(query_for_extend)) } else { None };
 
+    // Precompute query score profile for fast ungapped extension:
+    // profile[q_residue][s_residue] = score, accessed as profile[query[i]][subject[j]]
+    let score_profile: Vec<[i32; 28]> = query_for_extend.iter().map(|&q| {
+        let mut row = [0i32; 28];
+        for r in 0..28u8 {
+            row[r as usize] = matrix.scores[q as usize % 28][r as usize];
+        }
+        row
+    }).collect();
+
     // Process each OID (parallelized with rayon)
+    // Thread-local scratch buffers avoid per-subject allocation
     let oids: Vec<u32> = (0..db.num_sequences()).collect();
 
     let mut results: Vec<SearchResult> = oids.par_iter().filter_map(|&oid| {
         let subject = match db.get_sequence_protein_raw(oid) {
-            Ok(s) => s.to_vec(),
+            Ok(s) => s,
             Err(_) => return None,
         };
-        if subject.is_empty() { return None; }
+        if subject.len() < lookup.word_size { return None; }
 
-        let mut hsps = search_one_protein(
-            query_for_extend, &subject, &lookup, &matrix, &ka, params, eff_query_len, eff_db_len,
+        let mut hsps = search_one_protein_fast(
+            query_for_extend, subject, &lookup, &matrix, &ka, params,
+            eff_query_len, eff_db_len, &score_profile,
         );
 
         // Composition adjustment
         if let Some(ref qc) = query_comp {
-            let sc = composition_ncbistdaa(&subject);
+            let sc = composition_ncbistdaa(subject);
             for hsp in &mut hsps {
                 hsp.evalue = adjust_evalue(
                     hsp.evalue, hsp.score, qc, &sc, &matrix,
@@ -254,7 +266,6 @@ pub fn blast_search(
 
         if hsps.is_empty() { return None; }
 
-        // Apply max_hsps limit per subject
         if let Some(max) = params.max_hsps {
             hsps.truncate(max);
         }
@@ -274,7 +285,250 @@ pub fn blast_search(
     results
 }
 
-/// Search one protein subject sequence.
+/// Optimized protein search for one subject.
+/// Uses precomputed score profile, rolling word codes, and minimized allocations.
+#[allow(clippy::too_many_arguments)]
+fn search_one_protein_fast(
+    query: &[u8],
+    subject: &[u8],
+    lookup: &ProteinLookup,
+    matrix: &ScoringMatrix,
+    ka: &KarlinAltschul,
+    params: &SearchParams,
+    eff_query_len: usize,
+    eff_db_len: u64,
+    score_profile: &[[i32; 28]],
+) -> Vec<Hsp> {
+    let slen = subject.len();
+    let ws = lookup.word_size;
+    if slen < ws { return vec![]; }
+
+    // Rolling word codes for subject
+    let modulus = 28u32.pow(ws as u32 - 1);
+    let num_words = slen - ws + 1;
+
+    // Quick scan: count total hits before doing extensions.
+    // If no hits at all, skip this subject immediately.
+    let mut total_hits = 0u32;
+    let mut code = 0u32;
+    for &r in subject.iter().take(ws) {
+        code = code * 28 + (r as u32 % 28);
+    }
+    if !lookup.table[code as usize].is_empty() { total_hits += 1; }
+    for &r in subject.iter().skip(ws) {
+        code = (code % modulus) * 28 + (r as u32 % 28);
+        if !lookup.table[code as usize].is_empty() { total_hits += 1; }
+    }
+    if total_hits == 0 { return vec![]; }
+
+    let diag_offset = query.len();
+    let diag_len = query.len() + slen + 1;
+    let cutoff = params.ungapped_cutoff.max(1);
+
+    // Ungapped extension using score profile (avoids matrix.score() bounds checks)
+    let ungapped_extend_fast = |q_pos: usize, s_pos: usize| -> (i32, usize, usize, usize, usize) {
+        let mut best = 0i32;
+        let mut best_q_start = q_pos;
+        let mut best_s_start = s_pos;
+
+        // Extend left
+        let mut score = 0i32;
+        let mut qi = q_pos;
+        let mut si = s_pos;
+        while qi > 0 && si > 0 {
+            qi -= 1;
+            si -= 1;
+            score += score_profile[qi][subject[si] as usize % 28];
+            if score > best {
+                best = score;
+                best_q_start = qi;
+                best_s_start = si;
+            } else if best - score > params.x_drop_ungapped {
+                break;
+            }
+        }
+        let left_score = best;
+
+        // Extend right
+        let mut qi = q_pos;
+        let mut si = s_pos;
+        score = 0;
+        best = 0;
+        let mut best_q_end = q_pos;
+        let mut best_s_end = s_pos;
+        while qi < query.len() && si < slen {
+            score += score_profile[qi][subject[si] as usize % 28];
+            if score > best {
+                best = score;
+                best_q_end = qi + 1;
+                best_s_end = si + 1;
+            } else if best - score > params.x_drop_ungapped {
+                break;
+            }
+            qi += 1;
+            si += 1;
+        }
+
+        let center = if q_pos < query.len() && s_pos < slen {
+            score_profile[q_pos][subject[s_pos] as usize % 28]
+        } else { 0 };
+
+        (left_score + center + best, best_q_start, best_q_end, best_s_start, best_s_end)
+    };
+
+    let mut ungapped_hits: Vec<(i32, usize, usize, usize, usize)> = Vec::new();
+
+    if params.two_hit {
+        let mut diag_last: Vec<i32> = vec![i32::MIN; diag_len];
+        let mut diag_extended: Vec<bool> = vec![false; diag_len];
+
+        let mut code = 0u32;
+        for &r in subject.iter().take(ws) {
+            code = code * 28 + (r as u32 % 28);
+        }
+        // Process first word
+        for &q_pos in &lookup.table[code as usize] {
+            let q_pos = q_pos as usize;
+            let diag = (0isize - q_pos as isize + diag_offset as isize) as usize;
+            if diag < diag_len { diag_last[diag] = 0; }
+        }
+        // Process remaining words with rolling code
+        for s_pos in 1..num_words {
+            code = (code % modulus) * 28 + (subject[s_pos + ws - 1] as u32 % 28);
+            let positions = &lookup.table[code as usize];
+            if positions.is_empty() { continue; }
+            for &q_pos in positions {
+                let q_pos = q_pos as usize;
+                let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
+                if diag >= diag_len { continue; }
+                if diag_extended[diag] { continue; }
+
+                let prev = diag_last[diag];
+                if prev == i32::MIN {
+                    diag_last[diag] = s_pos as i32;
+                    continue;
+                }
+                let dist = (s_pos as i32) - prev;
+                if dist > params.two_hit_window as i32 {
+                    diag_last[diag] = s_pos as i32;
+                    continue;
+                }
+
+                let (score, qs, qe, ss, se) = ungapped_extend_fast(q_pos, s_pos);
+                if score >= cutoff {
+                    diag_extended[diag] = true;
+                    ungapped_hits.push((score, qs, qe, ss, se));
+                }
+            }
+        }
+    } else {
+        let mut diag_hit: Vec<bool> = vec![false; diag_len];
+
+        let mut code = 0u32;
+        for &r in subject.iter().take(ws) {
+            code = code * 28 + (r as u32 % 28);
+        }
+        // Inline the scan + extend loop with rolling codes
+        {
+            let positions = &lookup.table[code as usize];
+            for &q_pos in positions {
+                let q_pos = q_pos as usize;
+                let diag = (0isize - q_pos as isize + diag_offset as isize) as usize;
+                if diag < diag_len && diag_hit[diag] { continue; }
+                let (score, qs, qe, ss, se) = ungapped_extend_fast(q_pos, 0);
+                if score >= cutoff {
+                    if diag < diag_len { diag_hit[diag] = true; }
+                    ungapped_hits.push((score, qs, qe, ss, se));
+                }
+            }
+        }
+        for s_pos in 1..num_words {
+            code = (code % modulus) * 28 + (subject[s_pos + ws - 1] as u32 % 28);
+            let positions = &lookup.table[code as usize];
+            if positions.is_empty() { continue; }
+            for &q_pos in positions {
+                let q_pos = q_pos as usize;
+                let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
+                if diag < diag_len && diag_hit[diag] { continue; }
+                let (score, qs, qe, ss, se) = ungapped_extend_fast(q_pos, s_pos);
+                if score >= cutoff {
+                    if diag < diag_len { diag_hit[diag] = true; }
+                    ungapped_hits.push((score, qs, qe, ss, se));
+                }
+            }
+        }
+    }
+
+    if ungapped_hits.is_empty() { return vec![]; }
+
+    ungapped_hits.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // Gapped extension with two-stage approach
+    let mut hsps = Vec::new();
+    let mut covered_query: Vec<bool> = vec![false; query.len()];
+
+    for &(_, qs, qe, ss, se) in &ungapped_hits {
+        let center_q = (qs + qe) / 2;
+        if center_q < covered_query.len() && covered_query[center_q] {
+            continue;
+        }
+        let center_s = (ss + se) / 2;
+
+        // Stage 1: score-only preliminary check
+        let prelim_score = gapped_extend_score_only(
+            query, subject, center_q, center_s, matrix,
+            params.gap_open, params.gap_extend, params.x_drop_gapped,
+        );
+        if prelim_score <= 0 { continue; }
+        let prelim_evalue = ka.evalue(prelim_score, eff_query_len, eff_db_len);
+        if prelim_evalue > params.evalue_threshold { continue; }
+
+        // Stage 2: full extension with traceback
+        let final_x_drop = params.x_drop_final.max(params.x_drop_gapped);
+        let gh = gapped_extend(
+            query, subject, center_q, center_s, matrix,
+            params.gap_open, params.gap_extend, final_x_drop,
+        );
+        if gh.score <= 0 { continue; }
+        let evalue = ka.evalue(gh.score, eff_query_len, eff_db_len);
+        if evalue > params.evalue_threshold { continue; }
+
+        let dominated = hsps.iter().any(|existing: &Hsp| {
+            let ov_start = gh.q_start.max(existing.query_start);
+            let ov_end = gh.q_end.min(existing.query_end);
+            if ov_end <= ov_start { return false; }
+            let overlap = ov_end - ov_start;
+            let shorter = (gh.q_end - gh.q_start).min(existing.query_end - existing.query_start);
+            overlap * 2 > shorter
+        });
+        if dominated { continue; }
+
+        let bit_score = ka.bit_score(gh.score);
+        let cover_start = gh.q_start.min(covered_query.len());
+        let cover_end = gh.q_end.min(covered_query.len());
+        for item in covered_query.iter_mut().take(cover_end).skip(cover_start) {
+            *item = true;
+        }
+
+        let query_aln = crate::db::sequence::decode_protein(&gh.query_aln);
+        let subject_aln = crate::db::sequence::decode_protein(&gh.subject_aln);
+
+        hsps.push(Hsp {
+            score: gh.score, bit_score, evalue,
+            query_start: gh.q_start, query_end: gh.q_end,
+            subject_start: gh.s_start, subject_end: gh.s_end,
+            num_identities: gh.num_identities, num_gaps: gh.num_gaps,
+            alignment_length: gh.query_aln.len(),
+            query_aln, midline: gh.midline, subject_aln,
+            query_frame: 0, subject_frame: 0,
+        });
+    }
+
+    hsps.sort_by(|a, b| a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal));
+    hsps
+}
+
+/// Search one protein subject sequence (original version, used by tblastn/tblastx/psiblast).
 #[allow(clippy::too_many_arguments)]
 fn search_one_protein(
     query: &[u8],
