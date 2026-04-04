@@ -238,6 +238,11 @@ pub fn blast_search(
 
     // Process each OID (parallelized with rayon)
     // Thread-local scratch buffers avoid per-subject allocation
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH: RefCell<SearchScratch> = RefCell::new(SearchScratch::new());
+    }
+
     let oids: Vec<u32> = (0..db.num_sequences()).collect();
 
     let mut results: Vec<SearchResult> = oids.par_iter().filter_map(|&oid| {
@@ -247,10 +252,13 @@ pub fn blast_search(
         };
         if subject.len() < lookup.word_size { return None; }
 
-        let mut hsps = search_one_protein_fast(
-            query_for_extend, subject, &lookup, &matrix, &ka, params,
-            eff_query_len, eff_db_len, &score_profile,
-        );
+        let mut hsps = SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            search_one_protein_scratch(
+                query_for_extend, subject, &lookup, &matrix, &ka, params,
+                eff_query_len, eff_db_len, &score_profile, &mut scratch,
+            )
+        });
 
         // Composition adjustment
         if let Some(ref qc) = query_comp {
@@ -285,9 +293,269 @@ pub fn blast_search(
     results
 }
 
-/// Optimized protein search for one subject.
-/// Uses precomputed score profile, rolling word codes, and minimized allocations.
+/// Thread-local scratch buffers reused across subjects to avoid per-subject allocation.
+struct SearchScratch {
+    diag_last: Vec<i32>,
+    diag_flags: Vec<bool>,
+    ungapped_hits: Vec<(i32, usize, usize, usize, usize)>,
+    covered_query: Vec<bool>,
+}
+
+impl SearchScratch {
+    fn new() -> Self {
+        SearchScratch {
+            diag_last: Vec::new(),
+            diag_flags: Vec::new(),
+            ungapped_hits: Vec::new(),
+            covered_query: Vec::new(),
+        }
+    }
+
+    /// Ensure diagonal arrays are at least `len` and reset to initial values.
+    fn reset_diags(&mut self, len: usize, two_hit: bool) {
+        if two_hit {
+            self.diag_last.resize(len, i32::MIN);
+            self.diag_last[..len].fill(i32::MIN);
+            self.diag_flags.resize(len, false);
+            self.diag_flags[..len].fill(false);
+        } else {
+            self.diag_flags.resize(len, false);
+            self.diag_flags[..len].fill(false);
+        }
+    }
+
+    fn reset_covered(&mut self, len: usize) {
+        self.covered_query.resize(len, false);
+        self.covered_query[..len].fill(false);
+    }
+}
+
+/// Optimized protein search with reusable scratch buffers.
+/// Combines hit scanning and extension in a single pass (no separate pre-scan).
 #[allow(clippy::too_many_arguments)]
+fn search_one_protein_scratch(
+    query: &[u8],
+    subject: &[u8],
+    lookup: &ProteinLookup,
+    matrix: &ScoringMatrix,
+    ka: &KarlinAltschul,
+    params: &SearchParams,
+    eff_query_len: usize,
+    eff_db_len: u64,
+    score_profile: &[[i32; 28]],
+    scratch: &mut SearchScratch,
+) -> Vec<Hsp> {
+    let slen = subject.len();
+    let ws = lookup.word_size;
+    if slen < ws { return vec![]; }
+
+    let modulus = 28u32.pow(ws as u32 - 1);
+    let num_words = slen - ws + 1;
+    let diag_offset = query.len();
+    let diag_len = query.len() + slen + 1;
+    let cutoff = params.ungapped_cutoff.max(1);
+    let x_drop = params.x_drop_ungapped;
+
+    // Reuse scratch diagonal arrays (avoids alloc per subject)
+    scratch.reset_diags(diag_len, params.two_hit);
+    scratch.ungapped_hits.clear();
+
+    // Build initial rolling word code
+    let mut code = 0u32;
+    for &r in subject.iter().take(ws) {
+        code = code * 28 + (r as u32 % 28);
+    }
+
+    // Single-pass: scan subject words and extend hits inline
+    // (eliminates the separate hit-count pre-scan)
+    if params.two_hit {
+        // Process first word (s_pos=0)
+        for &q_pos in &lookup.table[code as usize] {
+            let diag = (0isize - q_pos as isize + diag_offset as isize) as usize;
+            if diag < diag_len { scratch.diag_last[diag] = 0; }
+        }
+        for s_pos in 1..num_words {
+            code = (code % modulus) * 28 + (subject[s_pos + ws - 1] as u32 % 28);
+            let positions = &lookup.table[code as usize];
+            if positions.is_empty() { continue; }
+            for &q_pos in positions {
+                let q_pos = q_pos as usize;
+                let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
+                if diag >= diag_len || scratch.diag_flags[diag] { continue; }
+
+                let prev = scratch.diag_last[diag];
+                if prev == i32::MIN {
+                    scratch.diag_last[diag] = s_pos as i32;
+                    continue;
+                }
+                if (s_pos as i32) - prev > params.two_hit_window as i32 {
+                    scratch.diag_last[diag] = s_pos as i32;
+                    continue;
+                }
+
+                let hit = ungapped_extend_inline(query, subject, q_pos, s_pos, score_profile, x_drop);
+                if hit.0 >= cutoff {
+                    scratch.diag_flags[diag] = true;
+                    scratch.ungapped_hits.push(hit);
+                }
+            }
+        }
+    } else {
+        // Single-hit mode: process all words in one pass
+        {
+            let positions = &lookup.table[code as usize];
+            for &q_pos in positions {
+                let q_pos = q_pos as usize;
+                let diag = (0isize - q_pos as isize + diag_offset as isize) as usize;
+                if diag < diag_len && scratch.diag_flags[diag] { continue; }
+                let hit = ungapped_extend_inline(query, subject, q_pos, 0, score_profile, x_drop);
+                if hit.0 >= cutoff {
+                    if diag < diag_len { scratch.diag_flags[diag] = true; }
+                    scratch.ungapped_hits.push(hit);
+                }
+            }
+        }
+        for s_pos in 1..num_words {
+            code = (code % modulus) * 28 + (subject[s_pos + ws - 1] as u32 % 28);
+            let positions = &lookup.table[code as usize];
+            if positions.is_empty() { continue; }
+            for &q_pos in positions {
+                let q_pos = q_pos as usize;
+                let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
+                if diag < diag_len && scratch.diag_flags[diag] { continue; }
+                let hit = ungapped_extend_inline(query, subject, q_pos, s_pos, score_profile, x_drop);
+                if hit.0 >= cutoff {
+                    if diag < diag_len { scratch.diag_flags[diag] = true; }
+                    scratch.ungapped_hits.push(hit);
+                }
+            }
+        }
+    }
+
+    if scratch.ungapped_hits.is_empty() { return vec![]; }
+
+    scratch.ungapped_hits.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
+    // Gapped extension with two-stage approach (reuse covered_query buffer)
+    scratch.reset_covered(query.len());
+    let mut hsps = Vec::new();
+
+    for &(_, qs, qe, ss, se) in &scratch.ungapped_hits {
+        let center_q = (qs + qe) / 2;
+        if center_q < query.len() && scratch.covered_query[center_q] { continue; }
+        let center_s = (ss + se) / 2;
+
+        let prelim_score = gapped_extend_score_only(
+            query, subject, center_q, center_s, matrix,
+            params.gap_open, params.gap_extend, params.x_drop_gapped,
+        );
+        if prelim_score <= 0 { continue; }
+        let prelim_evalue = ka.evalue(prelim_score, eff_query_len, eff_db_len);
+        if prelim_evalue > params.evalue_threshold { continue; }
+
+        let final_x_drop = params.x_drop_final.max(params.x_drop_gapped);
+        let gh = gapped_extend(
+            query, subject, center_q, center_s, matrix,
+            params.gap_open, params.gap_extend, final_x_drop,
+        );
+        if gh.score <= 0 { continue; }
+        let evalue = ka.evalue(gh.score, eff_query_len, eff_db_len);
+        if evalue > params.evalue_threshold { continue; }
+
+        let dominated = hsps.iter().any(|existing: &Hsp| {
+            let ov_start = gh.q_start.max(existing.query_start);
+            let ov_end = gh.q_end.min(existing.query_end);
+            if ov_end <= ov_start { return false; }
+            let overlap = ov_end - ov_start;
+            let shorter = (gh.q_end - gh.q_start).min(existing.query_end - existing.query_start);
+            overlap * 2 > shorter
+        });
+        if dominated { continue; }
+
+        let bit_score = ka.bit_score(gh.score);
+        for i in gh.q_start.min(query.len())..gh.q_end.min(query.len()) {
+            scratch.covered_query[i] = true;
+        }
+
+        let query_aln = crate::db::sequence::decode_protein(&gh.query_aln);
+        let subject_aln = crate::db::sequence::decode_protein(&gh.subject_aln);
+
+        hsps.push(Hsp {
+            score: gh.score, bit_score, evalue,
+            query_start: gh.q_start, query_end: gh.q_end,
+            subject_start: gh.s_start, subject_end: gh.s_end,
+            num_identities: gh.num_identities, num_gaps: gh.num_gaps,
+            alignment_length: gh.query_aln.len(),
+            query_aln, midline: gh.midline, subject_aln,
+            query_frame: 0, subject_frame: 0,
+        });
+    }
+
+    hsps.sort_by(|a, b| a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal));
+    hsps
+}
+
+/// Inline ungapped extension using precomputed score profile.
+/// Returns (score, q_start, q_end, s_start, s_end).
+#[inline]
+fn ungapped_extend_inline(
+    query: &[u8], subject: &[u8], q_pos: usize, s_pos: usize,
+    score_profile: &[[i32; 28]], x_drop: i32,
+) -> (i32, usize, usize, usize, usize) {
+    let slen = subject.len();
+    let qlen = query.len();
+    let mut best = 0i32;
+    let mut best_q_start = q_pos;
+    let mut best_s_start = s_pos;
+
+    // Extend left
+    let mut score = 0i32;
+    let mut qi = q_pos;
+    let mut si = s_pos;
+    while qi > 0 && si > 0 {
+        qi -= 1;
+        si -= 1;
+        score += score_profile[qi][subject[si] as usize % 28];
+        if score > best {
+            best = score;
+            best_q_start = qi;
+            best_s_start = si;
+        } else if best - score > x_drop {
+            break;
+        }
+    }
+    let left_score = best;
+
+    // Extend right
+    qi = q_pos;
+    si = s_pos;
+    score = 0;
+    best = 0;
+    let mut best_q_end = q_pos;
+    let mut best_s_end = s_pos;
+    while qi < qlen && si < slen {
+        score += score_profile[qi][subject[si] as usize % 28];
+        if score > best {
+            best = score;
+            best_q_end = qi + 1;
+            best_s_end = si + 1;
+        } else if best - score > x_drop {
+            break;
+        }
+        qi += 1;
+        si += 1;
+    }
+
+    let center = if q_pos < qlen && s_pos < slen {
+        score_profile[q_pos][subject[s_pos] as usize % 28]
+    } else { 0 };
+
+    (left_score + center + best, best_q_start, best_q_end, best_s_start, best_s_end)
+}
+
+/// Optimized protein search for one subject (legacy, used by search_one_protein_fast).
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn search_one_protein_fast(
     query: &[u8],
     subject: &[u8],
