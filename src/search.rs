@@ -311,8 +311,6 @@ pub fn blast_search(
 struct SearchScratch {
     diag_last: Vec<i32>,
     diag_flags: Vec<bool>,
-    /// Diagonals that were touched (for selective reset instead of full memset)
-    touched_diags: Vec<usize>,
     ungapped_hits: Vec<(i32, usize, usize, usize, usize)>,
     covered_query: Vec<bool>,
 }
@@ -322,36 +320,18 @@ impl SearchScratch {
         SearchScratch {
             diag_last: Vec::new(),
             diag_flags: Vec::new(),
-            touched_diags: Vec::new(),
             ungapped_hits: Vec::new(),
             covered_query: Vec::new(),
         }
     }
 
-    /// Ensure diagonal arrays are at least `len`. Uses selective reset of
-    /// previously-touched diagonals instead of clearing the full array.
     fn reset_diags(&mut self, len: usize, two_hit: bool) {
-        // First call: allocate and zero-fill
-        if self.diag_flags.len() < len {
-            self.diag_flags.resize(len, false);
-            if two_hit { self.diag_last.resize(len, i32::MIN); }
+        if two_hit {
+            self.diag_last.resize(len, i32::MIN);
+            self.diag_last[..len].fill(i32::MIN);
         }
-        // Selective reset: only clear diagonals touched in previous search
-        for &d in &self.touched_diags {
-            if d < self.diag_flags.len() {
-                self.diag_flags[d] = false;
-                if two_hit && d < self.diag_last.len() {
-                    self.diag_last[d] = i32::MIN;
-                }
-            }
-        }
-        self.touched_diags.clear();
-    }
-
-    /// Record a diagonal that was modified (for selective reset next time).
-    #[inline]
-    fn touch_diag(&mut self, diag: usize) {
-        self.touched_diags.push(diag);
+        self.diag_flags.resize(len, false);
+        self.diag_flags[..len].fill(false);
     }
 
     fn reset_covered(&mut self, len: usize) {
@@ -404,7 +384,7 @@ fn search_one_protein_scratch(
             let diag = (0isize - q_pos as isize + diag_offset as isize) as usize;
             if diag < diag_len {
                 scratch.diag_last[diag] = 0;
-                scratch.touch_diag(diag);
+
             }
         }
         for s_pos in 1..num_words {
@@ -419,7 +399,7 @@ fn search_one_protein_scratch(
                 let prev = scratch.diag_last[diag];
                 if prev == i32::MIN {
                     scratch.diag_last[diag] = s_pos as i32;
-                    scratch.touch_diag(diag);
+    
                     continue;
                 }
                 if (s_pos as i32) - prev > params.two_hit_window as i32 {
@@ -446,7 +426,7 @@ fn search_one_protein_scratch(
                 if hit.0 >= cutoff {
                     if diag < diag_len {
                         scratch.diag_flags[diag] = true;
-                        scratch.touch_diag(diag);
+        
                     }
                     scratch.ungapped_hits.push(hit);
                 }
@@ -464,7 +444,7 @@ fn search_one_protein_scratch(
                 if hit.0 >= cutoff {
                     if diag < diag_len {
                         scratch.diag_flags[diag] = true;
-                        scratch.touch_diag(diag);
+        
                     }
                     scratch.ungapped_hits.push(hit);
                 }
