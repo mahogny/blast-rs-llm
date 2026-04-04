@@ -268,6 +268,9 @@ pub fn blast_search(
 
         let mut hsps = SCRATCH.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
+            if scratch.diag_mask == 0 {
+                scratch.init_diags(query_for_extend.len());
+            }
             search_one_protein_scratch(
                 query_for_extend, subject, &lookup, &matrix, &ka, params,
                 eff_query_len, eff_db_len, &score_profile, &mut scratch,
@@ -307,10 +310,39 @@ pub fn blast_search(
     results
 }
 
-/// Thread-local scratch buffers reused across subjects to avoid per-subject allocation.
+/// Diagonal state: packed last_hit + flag in a single u32.
+/// Matches NCBI's DiagStruct (last_hit:31, flag:1).
+/// Uses a global offset counter to avoid zeroing the array between subjects.
+#[derive(Clone, Copy)]
+struct DiagEntry(u32);
+
+impl DiagEntry {
+    const FLAG_BIT: u32 = 1 << 31;
+
+    #[inline]
+    fn new(last_hit: i32, flag: bool) -> Self {
+        let v = (last_hit as u32) & !Self::FLAG_BIT;
+        DiagEntry(if flag { v | Self::FLAG_BIT } else { v })
+    }
+
+    #[inline]
+    fn last_hit(self) -> i32 { (self.0 & !Self::FLAG_BIT) as i32 }
+
+    #[inline]
+    fn flag(self) -> bool { self.0 & Self::FLAG_BIT != 0 }
+}
+
+/// Thread-local scratch buffers reused across subjects.
+/// Uses NCBI's offset trick: instead of zeroing the diagonal array between subjects,
+/// we increment a global offset so stale entries are recognized by their old offset values.
 struct SearchScratch {
-    diag_last: Vec<i32>,
-    diag_flags: Vec<bool>,
+    diag_array: Vec<DiagEntry>,
+    diag_mask: usize,
+    /// Offset added to subject positions to distinguish entries from different subjects.
+    /// Incremented by (max_subject_len + window + 1) after each subject.
+    diag_offset: i32,
+    /// Batch of (query_offset, subject_offset) hit pairs from scanning.
+    offset_pairs: Vec<(u32, u32)>,
     ungapped_hits: Vec<(i32, usize, usize, usize, usize)>,
     covered_query: Vec<bool>,
 }
@@ -318,20 +350,37 @@ struct SearchScratch {
 impl SearchScratch {
     fn new() -> Self {
         SearchScratch {
-            diag_last: Vec::new(),
-            diag_flags: Vec::new(),
+            diag_array: Vec::new(),
+            diag_mask: 0,
+            diag_offset: 0,
+            offset_pairs: Vec::new(),
             ungapped_hits: Vec::new(),
             covered_query: Vec::new(),
         }
     }
 
-    fn reset_diags(&mut self, len: usize, two_hit: bool) {
-        if two_hit {
-            self.diag_last.resize(len, i32::MIN);
-            self.diag_last[..len].fill(i32::MIN);
+    /// Initialize diagonal array. Size is rounded to power of 2 for mask-based indexing.
+    /// The offset trick avoids zeroing between subjects.
+    fn init_diags(&mut self, query_len: usize) {
+        // Smallest power of 2 >= query_len
+        let mut size = 1;
+        while size < query_len { size <<= 1; }
+        if self.diag_array.len() < size {
+            self.diag_array.resize(size, DiagEntry(0));
         }
-        self.diag_flags.resize(len, false);
-        self.diag_flags[..len].fill(false);
+        self.diag_mask = size - 1;
+        self.diag_offset = 0;
+    }
+
+    /// Advance offset after processing one subject to invalidate stale diagonal entries.
+    #[inline]
+    fn advance_offset(&mut self, subject_len: usize, window: usize) {
+        self.diag_offset += (subject_len + window + 1) as i32;
+        // Wrap to prevent overflow
+        if self.diag_offset > i32::MAX / 2 {
+            self.diag_offset = 0;
+            self.diag_array.fill(DiagEntry(0));
+        }
     }
 
     fn reset_covered(&mut self, len: usize) {
@@ -340,8 +389,10 @@ impl SearchScratch {
     }
 }
 
-/// Optimized protein search with reusable scratch buffers.
-/// Combines hit scanning and extension in a single pass (no separate pre-scan).
+/// Optimized protein search using NCBI-style architecture:
+/// 1. Batch scan: collect all (q_off, s_off) hit pairs (cache-friendly)
+/// 2. Process hits: diagonal tracking with offset trick (no per-subject zeroing)
+/// 3. Ungapped extension only for two-hit or single-hit candidates
 #[allow(clippy::too_many_arguments)]
 fn search_one_protein_scratch(
     query: &[u8],
@@ -361,96 +412,94 @@ fn search_one_protein_scratch(
 
     let modulus = 28u32.pow(ws as u32 - 1);
     let num_words = slen - ws + 1;
-    let diag_offset = query.len();
-    let diag_len = query.len() + slen + 1;
     let cutoff = params.ungapped_cutoff.max(1);
     let x_drop = params.x_drop_ungapped;
+    let diag_mask = scratch.diag_mask;
+    let diag_offset = scratch.diag_offset;
+    let window = params.two_hit_window as i32;
 
-    // Reuse scratch diagonal arrays (avoids alloc per subject)
-    scratch.reset_diags(diag_len, params.two_hit);
     scratch.ungapped_hits.clear();
 
-    // Build initial rolling word code
-    let mut code = 0u32;
-    for &r in subject.iter().take(ws) {
-        code = code * 28 + (r as u32 % 28);
-    }
-
-    // Single-pass: scan subject words and extend hits inline
-    // (eliminates the separate hit-count pre-scan)
-    if params.two_hit {
-        // Process first word (s_pos=0)
+    // Phase 1: Batch scan — collect all (q_off, s_off) pairs
+    scratch.offset_pairs.clear();
+    {
+        let mut code = 0u32;
+        for &r in subject.iter().take(ws) {
+            code = code * 28 + (r as u32 % 28);
+        }
         for &q_pos in lookup.get_hits(code) {
-            let diag = (0isize - q_pos as isize + diag_offset as isize) as usize;
-            if diag < diag_len {
-                scratch.diag_last[diag] = 0;
-
-            }
+            scratch.offset_pairs.push((q_pos, 0));
         }
         for s_pos in 1..num_words {
             code = (code % modulus) * 28 + (subject[s_pos + ws - 1] as u32 % 28);
-            let positions = lookup.get_hits(code);
-            if positions.is_empty() { continue; }
-            for &q_pos in positions {
-                let q_pos = q_pos as usize;
-                let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
-                if diag >= diag_len || scratch.diag_flags[diag] { continue; }
+            let hits = lookup.get_hits(code);
+            if hits.is_empty() { continue; }
+            let s = s_pos as u32;
+            for &q_pos in hits {
+                scratch.offset_pairs.push((q_pos, s));
+            }
+        }
+    }
 
-                let prev = scratch.diag_last[diag];
-                if prev == i32::MIN {
-                    scratch.diag_last[diag] = s_pos as i32;
-    
+    if scratch.offset_pairs.is_empty() {
+        scratch.advance_offset(slen, params.two_hit_window);
+        return vec![];
+    }
+
+    // Phase 2: Process hits with NCBI-style diagonal tracking
+    if params.two_hit {
+        for i in 0..scratch.offset_pairs.len() {
+            let (q_off, s_off) = scratch.offset_pairs[i];
+            let q_pos = q_off as usize;
+            let s_pos = s_off as usize;
+            let diag_coord = q_pos.wrapping_sub(s_pos) & diag_mask;
+            let entry = scratch.diag_array[diag_coord];
+            let s_with_offset = s_off as i32 + diag_offset;
+
+            if entry.flag() {
+                // Already extended on this diagonal
+                if s_with_offset < entry.last_hit() { continue; }
+                scratch.diag_array[diag_coord] = DiagEntry::new(s_with_offset, false);
+            } else {
+                let last_hit = entry.last_hit() - diag_offset;
+                let diff = s_off as i32 - last_hit;
+
+                if diff >= window || diff < 0 {
+                    scratch.diag_array[diag_coord] = DiagEntry::new(s_with_offset, false);
                     continue;
                 }
-                if (s_pos as i32) - prev > params.two_hit_window as i32 {
-                    scratch.diag_last[diag] = s_pos as i32;
-                    continue;
-                }
+                if diff < ws as i32 { continue; }
 
+                // Two hits within window — extend
                 let hit = ungapped_extend_inline(query, subject, q_pos, s_pos, score_profile, x_drop);
                 if hit.0 >= cutoff {
-                    scratch.diag_flags[diag] = true;
                     scratch.ungapped_hits.push(hit);
+                    scratch.diag_array[diag_coord] = DiagEntry::new(hit.4 as i32 + diag_offset, true);
+                } else {
+                    scratch.diag_array[diag_coord] = DiagEntry::new(s_with_offset, false);
                 }
             }
         }
     } else {
-        // Single-hit mode: process all words in one pass
-        {
-            let positions = lookup.get_hits(code);
-            for &q_pos in positions {
-                let q_pos = q_pos as usize;
-                let diag = (0isize - q_pos as isize + diag_offset as isize) as usize;
-                if diag < diag_len && scratch.diag_flags[diag] { continue; }
-                let hit = ungapped_extend_inline(query, subject, q_pos, 0, score_profile, x_drop);
-                if hit.0 >= cutoff {
-                    if diag < diag_len {
-                        scratch.diag_flags[diag] = true;
-        
-                    }
-                    scratch.ungapped_hits.push(hit);
-                }
-            }
-        }
-        for s_pos in 1..num_words {
-            code = (code % modulus) * 28 + (subject[s_pos + ws - 1] as u32 % 28);
-            let positions = lookup.get_hits(code);
-            if positions.is_empty() { continue; }
-            for &q_pos in positions {
-                let q_pos = q_pos as usize;
-                let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
-                if diag < diag_len && scratch.diag_flags[diag] { continue; }
-                let hit = ungapped_extend_inline(query, subject, q_pos, s_pos, score_profile, x_drop);
-                if hit.0 >= cutoff {
-                    if diag < diag_len {
-                        scratch.diag_flags[diag] = true;
-        
-                    }
-                    scratch.ungapped_hits.push(hit);
-                }
+        for i in 0..scratch.offset_pairs.len() {
+            let (q_off, s_off) = scratch.offset_pairs[i];
+            let q_pos = q_off as usize;
+            let s_pos = s_off as usize;
+            let diag_coord = q_pos.wrapping_sub(s_pos) & diag_mask;
+            let entry = scratch.diag_array[diag_coord];
+            let s_with_offset = s_off as i32 + diag_offset;
+
+            if entry.flag() && s_with_offset < entry.last_hit() { continue; }
+
+            let hit = ungapped_extend_inline(query, subject, q_pos, s_pos, score_profile, x_drop);
+            if hit.0 >= cutoff {
+                scratch.diag_array[diag_coord] = DiagEntry::new(hit.4 as i32 + diag_offset, true);
+                scratch.ungapped_hits.push(hit);
             }
         }
     }
+
+    scratch.advance_offset(slen, params.two_hit_window);
 
     if scratch.ungapped_hits.is_empty() { return vec![]; }
 
