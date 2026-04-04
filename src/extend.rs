@@ -215,38 +215,16 @@ fn extend_one_direction(
         };
     }
 
-    // Full O(m*n) DP with traceback
-    // Cells: (i=query pos 0..qlen, j=subject pos 0..slen)
-    // H[i][j] = best alignment score ending at q[i-1], s[j-1] with match/mismatch
-    // E[i][j] = best score ending with gap in query (deletion)
-    // F[i][j] = best score ending with gap in subject (insertion)
+    // Banded X-drop DP with traceback.
+    // Only columns within the active band [j_lo, j_hi] are computed per row.
+    // The band shrinks from the left when cells drop below X-drop threshold
+    // and extends rightward only as far as cells remain viable.
+    // This reduces effective complexity from O(m*n) to O(m*W) where W is band width.
     const NEG_INF: i32 = i32::MIN / 2;
     let rows = qlen + 1;
     let cols = slen + 1;
 
-    let mut h = vec![NEG_INF; rows * cols];
-    let mut e = vec![NEG_INF; rows * cols];
-    let mut f = vec![NEG_INF; rows * cols];
-    // Traceback: 0=done, 1=diag, 2=up(gap_q), 3=left(gap_s)
-    let mut tb = vec![0u8; rows * cols];
-
-    h[0] = 0;
-    // Initialize first row and column with gap penalties
-    // Gap in query along first row
-    for j in 1..cols {
-        e[j] = NEG_INF;
-        f[j] = NEG_INF;
-        h[j] = NEG_INF; // No gaps from (0,0) along query in standard BLAST
-    }
-    for i in 1..rows {
-        e[i * cols] = NEG_INF;
-        f[i * cols] = NEG_INF;
-        h[i * cols] = NEG_INF;
-    }
-    h[0] = 0;
-
-    // Precompute query score profile: profile[i][r] = score of query[i] vs residue r
-    // Eliminates per-cell bounds-checked matrix lookup in the inner loop.
+    // Precompute query score profile
     let profile: Vec<[i32; 28]> = query.iter().map(|&q| {
         let mut row = [matrix.min_score; 28];
         for r in 0u8..28 {
@@ -255,47 +233,75 @@ fn extend_one_direction(
         row
     }).collect();
 
+    // Use two-row rolling storage for h, e, f (saves memory for long sequences).
+    // Traceback still needs full matrix.
+    let mut h_prev = vec![NEG_INF; cols];
+    let mut h_curr = vec![NEG_INF; cols];
+    let mut e_curr = vec![NEG_INF; cols];
+    let mut f_prev = vec![NEG_INF; cols];
+    let mut f_curr = vec![NEG_INF; cols];
+    let mut tb = vec![0u8; rows * cols];
+
+    h_prev[0] = 0;
+
     let mut best_score = 0i32;
     let mut best_i = 0usize;
     let mut best_j = 0usize;
 
+    // Active band: [j_lo, j_hi) — only iterate these columns per row
+    let mut j_lo: usize = 1;
+    let mut j_hi: usize = cols; // start unbounded, will shrink
+
     for i in 1..rows {
         let q_profile = &profile[i - 1];
-        for j in 1..cols {
-            let idx = i * cols + j;
-            let diag = h[(i-1) * cols + (j-1)];
-            let s = q_profile[subject[j-1] as usize % 28];
+
+        // Reset current row
+        h_curr.fill(NEG_INF);
+        e_curr.fill(NEG_INF);
+        f_curr.fill(NEG_INF);
+
+        let mut row_has_valid = false;
+        let mut new_j_lo = j_hi; // will be set to first valid j
+        let mut new_j_hi = j_lo; // will be set to last valid j + 1
+
+        // Extend j_lo leftward by 1 to allow gaps from diagonal, but not below 1
+        let j_start = if j_lo > 1 { j_lo - 1 } else { 1 };
+        // Extend j_hi rightward by 1 to allow gap opening
+        let j_end = (j_hi + 1).min(cols);
+
+        for j in j_start..j_end {
+            let diag = h_prev[j - 1];
+            let s = q_profile[subject[j - 1] as usize % 28];
             let match_score = if diag == NEG_INF { NEG_INF } else { diag + s };
 
             // E[i][j] = max(H[i][j-1] - gap_open - gap_extend, E[i][j-1] - gap_extend)
-            let h_left = h[i * cols + (j-1)];
-            let e_left = e[i * cols + (j-1)];
+            let h_left = if j > 0 { h_curr[j - 1] } else { NEG_INF };
+            let e_left = if j > 0 { e_curr[j - 1] } else { NEG_INF };
             let from_h_e = if h_left == NEG_INF { NEG_INF } else { h_left - gap_open - gap_extend };
             let from_e_e = if e_left == NEG_INF { NEG_INF } else { e_left - gap_extend };
-            e[idx] = from_h_e.max(from_e_e);
+            e_curr[j] = from_h_e.max(from_e_e);
 
             // F[i][j] = max(H[i-1][j] - gap_open - gap_extend, F[i-1][j] - gap_extend)
-            let h_up = h[(i-1) * cols + j];
-            let f_up = f[(i-1) * cols + j];
+            let h_up = h_prev[j];
+            let f_up = f_prev[j];
             let from_h_f = if h_up == NEG_INF { NEG_INF } else { h_up - gap_open - gap_extend };
             let from_f_f = if f_up == NEG_INF { NEG_INF } else { f_up - gap_extend };
-            f[idx] = from_h_f.max(from_f_f);
+            f_curr[j] = from_h_f.max(from_f_f);
 
-            // H[i][j] = max(match_score, E[i][j], F[i][j])
-            let cell_score = match_score.max(e[idx]).max(f[idx]);
+            let cell_score = match_score.max(e_curr[j]).max(f_curr[j]);
 
-            // X-drop pruning
+            let tb_idx = i * cols + j;
             if cell_score < best_score - x_drop {
-                h[idx] = NEG_INF;
-                tb[idx] = 0;
+                // Pruned
+                tb[tb_idx] = 0;
             } else {
-                h[idx] = cell_score;
+                h_curr[j] = cell_score;
                 if cell_score == match_score {
-                    tb[idx] = 1; // diagonal
-                } else if cell_score == e[idx] {
-                    tb[idx] = 3; // left (gap in query / insertion in subject)
+                    tb[tb_idx] = 1;
+                } else if cell_score == e_curr[j] {
+                    tb[tb_idx] = 3;
                 } else {
-                    tb[idx] = 2; // up (gap in subject / deletion from query)
+                    tb[tb_idx] = 2;
                 }
 
                 if cell_score > best_score {
@@ -303,8 +309,23 @@ fn extend_one_direction(
                     best_i = i;
                     best_j = j;
                 }
+
+                row_has_valid = true;
+                if j < new_j_lo { new_j_lo = j; }
+                if j + 1 > new_j_hi { new_j_hi = j + 1; }
             }
         }
+
+        if !row_has_valid {
+            break; // Entire row pruned — no point continuing
+        }
+
+        j_lo = new_j_lo;
+        j_hi = new_j_hi;
+
+        // Swap rows
+        std::mem::swap(&mut h_prev, &mut h_curr);
+        std::mem::swap(&mut f_prev, &mut f_curr);
     }
 
     // Traceback from (best_i, best_j)
@@ -318,38 +339,30 @@ fn extend_one_direction(
         let idx = i * cols + j;
         match tb[idx] {
             1 => {
-                // diagonal
-                let qi = query[i-1];
-                let si = subject[j-1];
+                let qi = query[i - 1];
+                let si = subject[j - 1];
                 query_aln.push(qi);
                 subject_aln.push(si);
-                if qi == si {
-                    midline.push(b'|');
-                } else {
-                    midline.push(b' ');
-                }
+                midline.push(if qi == si { b'|' } else { b' ' });
                 i -= 1;
                 j -= 1;
             }
             2 => {
-                // up: gap in subject
-                query_aln.push(query[i-1]);
+                query_aln.push(query[i - 1]);
                 midline.push(b' ');
                 subject_aln.push(b'-');
                 i -= 1;
             }
             3 => {
-                // left: gap in query
                 query_aln.push(b'-');
                 midline.push(b' ');
-                subject_aln.push(subject[j-1]);
+                subject_aln.push(subject[j - 1]);
                 j -= 1;
             }
             _ => break,
         }
     }
 
-    // Reverse traceback
     query_aln.reverse();
     midline.reverse();
     subject_aln.reverse();
