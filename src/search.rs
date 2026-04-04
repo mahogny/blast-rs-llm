@@ -238,6 +238,20 @@ pub fn blast_search(
     let threshold = adjusted_threshold(base_threshold, query_for_lookup.len());
     let lookup = ProteinLookup::build(query_for_lookup, params.word_size, &matrix, threshold);
 
+    // Compute NCBI-style gap_trigger cutoff: minimum ungapped score to attempt gapped extension.
+    // gap_trigger_bits = 22.0 (NCBI default), converted to raw score: (bits * ln2 + logK) / lambda.
+    // This filters out low-scoring ungapped hits that would waste time in gapped extension.
+    let gap_trigger_bits = 22.0f64;
+    let gap_trigger_score = ((gap_trigger_bits * std::f64::consts::LN_2 + ka.k.ln()) / ka.lambda) as i32;
+    // Cap at half the maximum possible ungapped score for the query length,
+    // so short queries (e.g. translated 8aa frames) aren't filtered too aggressively.
+    let max_possible = (query_for_extend.len() as i32) * 4; // ~4 per residue avg for BLOSUM62 self-match
+    let effective_cutoff = if params.ungapped_cutoff > 0 {
+        params.ungapped_cutoff
+    } else {
+        gap_trigger_score.max(1).min(max_possible / 2)
+    };
+
     let query_comp = if params.comp_adjust { Some(composition_ncbistdaa(query_for_extend)) } else { None };
 
     // Precompute query score profile for fast ungapped extension:
@@ -274,6 +288,7 @@ pub fn blast_search(
             search_one_protein_scratch(
                 query_for_extend, subject, &lookup, &matrix, &ka, params,
                 eff_query_len, eff_db_len, &score_profile, &mut scratch,
+                effective_cutoff,
             )
         });
 
@@ -405,13 +420,14 @@ fn search_one_protein_scratch(
     eff_db_len: u64,
     score_profile: &[[i32; 28]],
     scratch: &mut SearchScratch,
+    ungapped_cutoff: i32,
 ) -> Vec<Hsp> {
     let slen = subject.len();
     let ws = lookup.word_size;
     if slen < ws { return vec![]; }
 
     let num_words = slen - ws + 1;
-    let cutoff = params.ungapped_cutoff.max(1);
+    let cutoff = ungapped_cutoff;
     let x_drop = params.x_drop_ungapped;
     let diag_mask = scratch.diag_mask;
     let diag_offset = scratch.diag_offset;
