@@ -2,28 +2,34 @@
 
 use crate::matrix::ScoringMatrix;
 
+/// NCBI-style backbone cell: stores up to 3 hits inline to avoid
+/// pointer dereference for the common case (single cache line access).
+#[derive(Clone, Copy)]
+struct BackboneCell {
+    /// Number of hits: 0 = empty, 1-3 = inline, >3 = overflow
+    num_used: u32,
+    /// Inline storage for up to 3 query positions, or overflow cursor
+    data: [u32; 3],
+}
+
 /// Protein lookup table using neighboring words.
 ///
-/// Uses NCBI-style shift-based indexing (charsize=5 bits per residue) for fast
-/// rolling hash computation via shift+or+mask instead of multiply+modulo.
-/// Table size: 2^(word_size * 5) = 32768 for word_size=3.
-///
-/// Cache-friendly packed layout:
-/// - `presence`: bitfield (~4 KB for word_size=3) — fits in L1, quick rejection
-/// - `table`: compact (offset, len) pairs for direct indexing
-/// - `hits`: flat packed array of all query positions
+/// Uses NCBI-style architecture:
+/// - Shift-based indexing (charsize=5) for fast rolling hash
+/// - Backbone cells with up to 3 inline hits (no pointer dereference)
+/// - Overflow array for words with >3 hits
+/// - Presence bitfield for quick empty-cell rejection
 pub struct ProteinLookup {
     pub word_size: usize,
-    /// Number of bits per residue (5 for Ncbistdaa alphabet of 28)
     pub charsize: u32,
-    /// Mask for rolling hash: (1 << (word_size * charsize)) - 1
     pub mask: u32,
-    /// Presence bitfield: bit `code` is set if any query word matches word `code`.
+    /// Presence bitfield for quick rejection (~4 KB, L1-resident)
     presence: Vec<u64>,
-    /// Flat packed array of query positions for all words, concatenated.
-    hits: Vec<u32>,
-    /// Direct index: table[code] = (offset_into_hits, count)
-    pub table: Vec<(u32, u32)>,
+    /// Backbone: one cell per possible word code. Most accesses are single cache line.
+    backbone: Vec<BackboneCell>,
+    /// Overflow array for words with >3 hits
+    overflow: Vec<u32>,
+    #[allow(dead_code)]
     capacity: usize,
 }
 
@@ -38,94 +44,95 @@ pub fn encode_protein_word(residues: &[u8]) -> u32 {
     code
 }
 
+/// Constant: max hits stored inline per backbone cell (matches NCBI AA_HITS_PER_CELL)
+const HITS_PER_CELL: usize = 3;
+
 impl ProteinLookup {
     /// Build lookup table from query (Ncbistdaa encoded).
-    /// Uses charsize=5 bit encoding for shift-based rolling hash.
     pub fn build(query: &[u8], word_size: usize, matrix: &ScoringMatrix, threshold: i32) -> Self {
-        let charsize = 5u32; // ilog2(28) + 1 = 5, matching NCBI
+        let charsize = 5u32;
         let capacity = 1usize << (word_size as u32 * charsize);
         let mask = (capacity - 1) as u32;
         let qlen = query.len();
+
+        let empty_cell = BackboneCell { num_used: 0, data: [0; 3] };
 
         if qlen < word_size {
             return ProteinLookup {
                 word_size, charsize, mask,
                 presence: vec![0u64; capacity.div_ceil(64)],
-                hits: Vec::new(),
-                table: vec![(0, 0); capacity],
+                backbone: vec![empty_cell; capacity],
+                overflow: Vec::new(),
                 capacity,
             };
         }
 
-        // Phase 1: collect hits using temporary Vec per code
+        // Phase 1: collect hits into temporary Vecs
         let mut tmp = vec![Vec::new(); capacity];
         for q_pos in 0..=(qlen - word_size) {
             let query_word = &query[q_pos..q_pos + word_size];
-            // Enumerate neighbors but encode with shift-based scheme
             enumerate_neighbors_shift(query_word, word_size, charsize, matrix, threshold, &mut |code| {
                 tmp[code as usize].push(q_pos as u32);
             });
         }
 
-        // Phase 2: pack into flat arrays
+        // Phase 2: pack into backbone + overflow (NCBI style)
         let mut presence = vec![0u64; capacity.div_ceil(64)];
-        let mut total = 0u32;
-        let mut offsets = vec![0u32; capacity + 1];
+        let mut backbone = vec![empty_cell; capacity];
+        let mut overflow = Vec::new();
+
         for code in 0..capacity {
-            offsets[code] = total;
-            if !tmp[code].is_empty() {
-                presence[code / 64] |= 1u64 << (code % 64);
+            let hits = &tmp[code];
+            if hits.is_empty() { continue; }
+
+            presence[code / 64] |= 1u64 << (code % 64);
+            let n = hits.len();
+            backbone[code].num_used = n as u32;
+
+            if n <= HITS_PER_CELL {
+                // Store inline — no pointer dereference needed at lookup time
+                for (i, &pos) in hits.iter().enumerate() {
+                    backbone[code].data[i] = pos;
+                }
+            } else {
+                // Overflow: store cursor into overflow array
+                backbone[code].data[0] = overflow.len() as u32;
+                overflow.extend_from_slice(hits);
             }
-            total += tmp[code].len() as u32;
-        }
-        offsets[capacity] = total;
-
-        let mut hits = vec![0u32; total as usize];
-        for code in 0..capacity {
-            let start = offsets[code] as usize;
-            for (i, &pos) in tmp[code].iter().enumerate() {
-                hits[start + i] = pos;
-            }
         }
 
-        let table: Vec<(u32, u32)> = (0..capacity)
-            .map(|code| (offsets[code], offsets[code + 1] - offsets[code]))
-            .collect();
-
-        ProteinLookup { word_size, charsize, mask, presence, hits, table, capacity }
+        ProteinLookup { word_size, charsize, mask, presence, backbone, overflow, capacity }
     }
 
-    /// Get the hit slice for a word code. Returns empty slice if no hits.
+    /// Get hits for a word code. Inlined for the hot scanning loop.
+    /// For ≤3 hits (common case): returns pointer into the backbone cell (single cache line).
+    /// For >3 hits: returns slice into overflow array.
     #[inline]
     pub fn get_hits(&self, code: u32) -> &[u32] {
         let code = code as usize;
-        if code < self.capacity {
-            let word = code / 64;
-            let bit = code % 64;
-            if unsafe { *self.presence.get_unchecked(word) } & (1u64 << bit) == 0 {
-                return &[];
-            }
-            let (start, len) = unsafe { *self.table.get_unchecked(code) };
-            unsafe { self.hits.get_unchecked(start as usize..(start + len) as usize) }
+        // Quick presence check (L1 cache — 4 KB bitfield)
+        let word = code >> 6;
+        let bit = code & 63;
+        if unsafe { *self.presence.get_unchecked(word) } & (1u64 << bit) == 0 {
+            return &[];
+        }
+        let cell = unsafe { self.backbone.get_unchecked(code) };
+        let n = cell.num_used as usize;
+        if n <= HITS_PER_CELL {
+            // Inline hits — same cache line as num_used, no pointer chase
+            unsafe { cell.data.get_unchecked(..n) }
         } else {
-            &[]
+            // Overflow
+            let start = cell.data[0] as usize;
+            unsafe { self.overflow.get_unchecked(start..start + n) }
         }
     }
 
     /// Look up query positions for a subject word (Ncbistdaa encoded).
     #[inline]
     pub fn lookup(&self, subject_word: &[u8]) -> Option<&[u32]> {
-        let code = encode_protein_word(subject_word) as usize;
-        if code < self.capacity {
-            let (start, len) = self.table[code];
-            if len > 0 {
-                Some(&self.hits[start as usize..(start + len) as usize])
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+        let hits = self.get_hits(encode_protein_word(subject_word));
+        if hits.is_empty() { None } else { Some(hits) }
     }
 }
 
