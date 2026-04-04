@@ -2,6 +2,62 @@
 
 use crate::matrix::ScoringMatrix;
 
+// ── SIMD helpers for x86_64 ─────────────────────────────────────────────────
+
+/// SIMD-accelerated F computation: f_curr[j] = max(h_prev[j] - goe, f_prev[j] - ge)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn compute_f_avx2(
+    h_prev: &[i32], f_prev: &[i32], f_curr: &mut [i32],
+    gap_open_extend: i32, gap_extend: i32,
+    j_start: usize, j_end: usize,
+) {
+    use std::arch::x86_64::*;
+    let goe = _mm256_set1_epi32(gap_open_extend);
+    let ge = _mm256_set1_epi32(gap_extend);
+
+    let mut j = j_start;
+    while j + 8 <= j_end {
+        let h = _mm256_loadu_si256(h_prev.as_ptr().add(j) as *const _);
+        let f = _mm256_loadu_si256(f_prev.as_ptr().add(j) as *const _);
+        let fh = _mm256_sub_epi32(h, goe);
+        let ff = _mm256_sub_epi32(f, ge);
+        let result = _mm256_max_epi32(fh, ff);
+        _mm256_storeu_si256(f_curr.as_mut_ptr().add(j) as *mut _, result);
+        j += 8;
+    }
+    for j in j..j_end {
+        f_curr[j] = (h_prev[j] - gap_open_extend).max(f_prev[j] - gap_extend);
+    }
+}
+
+/// SIMD-accelerated diagonal score: diag[j] = h_prev[j-1] + scores[j-1]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn compute_diag_avx2(
+    h_prev: &[i32], subject_scores: &[i32], diag_scores: &mut [i32],
+    j_start: usize, j_end: usize,
+) {
+    use std::arch::x86_64::*;
+    let mut j = j_start;
+    while j + 8 <= j_end {
+        let h = _mm256_loadu_si256(h_prev.as_ptr().add(j - 1) as *const _);
+        let s = _mm256_loadu_si256(subject_scores.as_ptr().add(j - 1) as *const _);
+        let result = _mm256_add_epi32(h, s);
+        _mm256_storeu_si256(diag_scores.as_mut_ptr().add(j) as *mut _, result);
+        j += 8;
+    }
+    for j in j..j_end {
+        diag_scores[j] = h_prev[j - 1] + subject_scores[j - 1];
+    }
+}
+
+/// Check if AVX2 is available at runtime.
+#[cfg(target_arch = "x86_64")]
+fn has_avx2() -> bool {
+    is_x86_feature_detected!("avx2")
+}
+
 /// Result of ungapped extension.
 #[derive(Debug, Clone)]
 pub struct UngappedHit {
@@ -238,6 +294,10 @@ fn extend_score_only(
     let mut f_prev = vec![NEG_INF; cols];
     let mut f_curr = vec![NEG_INF; cols];
     let mut diag_scores = vec![NEG_INF; cols];
+    let mut subject_scores = vec![0i32; slen];
+
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = has_avx2();
 
     h_prev[0] = 0;
     let mut best_score = 0i32;
@@ -250,29 +310,52 @@ fn extend_score_only(
         let j_start = if j_lo > 1 { j_lo - 1 } else { 1 };
         let j_end = (j_hi + 1).min(cols);
 
-        // Reset current row arrays
+        // Reset current row
         h_curr[..j_end].fill(NEG_INF);
         e_curr[..j_end].fill(NEG_INF);
 
-        // Step 1: Compute F values — depends only on previous row (auto-vectorizable)
+        // Precompute subject scores for this query row
         for j in j_start..j_end {
-            f_curr[j] = (h_prev[j] - gap_open_extend).max(f_prev[j] - gap_extend);
+            subject_scores[j - 1] = q_profile[subj_idx[j - 1]];
         }
 
-        // Step 2: Compute diagonal match scores (auto-vectorizable)
-        for j in j_start..j_end {
-            diag_scores[j] = h_prev[j - 1] + q_profile[subj_idx[j - 1]];
+        #[cfg(target_arch = "x86_64")]
+        if use_avx2 {
+            unsafe {
+                compute_f_avx2(&h_prev, &f_prev, &mut f_curr, gap_open_extend, gap_extend, j_start, j_end);
+                compute_diag_avx2(&h_prev, &subject_scores, &mut diag_scores, j_start, j_end);
+            }
+        } else {
+            for j in j_start..j_end {
+                f_curr[j] = (h_prev[j] - gap_open_extend).max(f_prev[j] - gap_extend);
+            }
+            for j in j_start..j_end {
+                diag_scores[j] = h_prev[j - 1] + subject_scores[j - 1];
+            }
         }
 
-        // Step 3: Sequential left-to-right sweep for E and H
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            for j in j_start..j_end {
+                f_curr[j] = (h_prev[j] - gap_open_extend).max(f_prev[j] - gap_extend);
+            }
+            for j in j_start..j_end {
+                diag_scores[j] = h_prev[j - 1] + subject_scores[j - 1];
+            }
+        }
+
+        // Sequential E sweep (left-to-right dependency)
+        for j in j_start..j_end {
+            e_curr[j] = (h_curr[j - 1] - gap_open_extend).max(e_curr[j - 1] - gap_extend);
+        }
+
+        // Combine: cell_score = max(diag, e, f) with X-drop pruning
         let mut row_has_valid = false;
         let mut new_j_lo = j_end;
         let mut new_j_hi = j_start;
         let drop_threshold = best_score - x_drop;
 
         for j in j_start..j_end {
-            e_curr[j] = (h_curr[j - 1] - gap_open_extend).max(e_curr[j - 1] - gap_extend);
-
             let cell_score = diag_scores[j].max(e_curr[j]).max(f_curr[j]);
 
             if cell_score >= drop_threshold {
@@ -353,7 +436,11 @@ fn extend_one_direction(
     let mut f_prev = vec![NEG_INF; cols];
     let mut f_curr = vec![NEG_INF; cols];
     let mut diag_scores = vec![NEG_INF; cols];
+    let mut subject_scores = vec![0i32; slen];
     let mut tb = vec![0u8; rows * cols];
+
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = has_avx2();
 
     h_prev[0] = 0;
 
@@ -370,18 +457,36 @@ fn extend_one_direction(
         let j_start = if j_lo > 1 { j_lo - 1 } else { 1 };
         let j_end = (j_hi + 1).min(cols);
 
-        // Reset current row arrays
         h_curr[..j_end].fill(NEG_INF);
         e_curr[..j_end].fill(NEG_INF);
 
-        // Step 1: Compute F values — depends only on previous row (auto-vectorizable)
         for j in j_start..j_end {
-            f_curr[j] = (h_prev[j] - gap_open_extend).max(f_prev[j] - gap_extend);
+            subject_scores[j - 1] = q_profile[subj_idx[j - 1]];
         }
 
-        // Step 2: Compute diagonal match scores (auto-vectorizable)
-        for j in j_start..j_end {
-            diag_scores[j] = h_prev[j - 1] + q_profile[subj_idx[j - 1]];
+        #[cfg(target_arch = "x86_64")]
+        if use_avx2 {
+            unsafe {
+                compute_f_avx2(&h_prev, &f_prev, &mut f_curr, gap_open_extend, gap_extend, j_start, j_end);
+                compute_diag_avx2(&h_prev, &subject_scores, &mut diag_scores, j_start, j_end);
+            }
+        } else {
+            for j in j_start..j_end {
+                f_curr[j] = (h_prev[j] - gap_open_extend).max(f_prev[j] - gap_extend);
+            }
+            for j in j_start..j_end {
+                diag_scores[j] = h_prev[j - 1] + subject_scores[j - 1];
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            for j in j_start..j_end {
+                f_curr[j] = (h_prev[j] - gap_open_extend).max(f_prev[j] - gap_extend);
+            }
+            for j in j_start..j_end {
+                diag_scores[j] = h_prev[j - 1] + subject_scores[j - 1];
+            }
         }
 
         // Step 3: Sequential left-to-right sweep for E, H, and traceback
