@@ -7,7 +7,7 @@ use crate::db::BlastDb;
 use crate::matrix::{ScoringMatrix, MatrixType, nt_to_2bit};
 use crate::stats::{KarlinAltschul, GapPenalty, lookup_ka_params, blastn_ka_params};
 use crate::lookup::{ProteinLookup, NucleotideLookup, DiscontiguousLookup};
-use crate::extend::{ungapped_extend, gapped_extend, ungapped_extend_nucleotide};
+use crate::extend::{ungapped_extend, gapped_extend, gapped_extend_score_only, ungapped_extend_nucleotide};
 use crate::hsp::{Hsp, SearchResult};
 use crate::translate::{six_frame_translate_with_code, strip_stops, TranslatedFrame, reverse_complement};
 use crate::compo::{composition_ncbistdaa, adjust_evalue};
@@ -378,12 +378,13 @@ fn search_one_protein(
     // Sort ungapped hits by score descending, deduplicate overlapping ones
     ungapped_hits.sort_by(|a, b| b.score.cmp(&a.score));
 
-    // Gapped extension of top ungapped hits
+    // Two-stage gapped extension:
+    // Stage 1: Score-only with low X-drop (fast rejection of most candidates)
+    // Stage 2: Full extension with traceback only for hits that pass stage 1
     let mut hsps = Vec::new();
     let mut covered_query: Vec<bool> = vec![false; query.len()];
 
     for uh in ungapped_hits {
-        // Skip if this region already covered by a higher-scoring gapped alignment
         let center_q = (uh.q_start + uh.q_end) / 2;
         if center_q < covered_query.len() && covered_query[center_q] {
             continue;
@@ -391,15 +392,20 @@ fn search_one_protein(
 
         let center_s = (uh.s_start + uh.s_end) / 2;
 
+        // Stage 1: quick score-only check with preliminary X-drop
+        let prelim_score = gapped_extend_score_only(
+            query, subject, center_q, center_s, matrix,
+            params.gap_open, params.gap_extend, params.x_drop_gapped,
+        );
+        if prelim_score <= 0 { continue; }
+        let prelim_evalue = ka.evalue(prelim_score, eff_query_len, eff_db_len);
+        if prelim_evalue > params.evalue_threshold { continue; }
+
+        // Stage 2: full extension with traceback (using final X-drop for better alignment)
+        let final_x_drop = params.x_drop_final.max(params.x_drop_gapped);
         let gh = gapped_extend(
-            query,
-            subject,
-            center_q,
-            center_s,
-            matrix,
-            params.gap_open,
-            params.gap_extend,
-            params.x_drop_gapped,
+            query, subject, center_q, center_s, matrix,
+            params.gap_open, params.gap_extend, final_x_drop,
         );
 
         if gh.score <= 0 { continue; }
@@ -441,30 +447,6 @@ fn search_one_protein(
             query_aln, midline: gh.midline, subject_aln,
             query_frame: 0, subject_frame: 0,
         });
-    }
-
-    // Final gapped extension with higher X-drop for accepted HSPs
-    if params.x_drop_final > params.x_drop_gapped {
-        for hsp in &mut hsps {
-            let center_q = (hsp.query_start + hsp.query_end) / 2;
-            let center_s = (hsp.subject_start + hsp.subject_end) / 2;
-            let gh = gapped_extend(query, subject, center_q, center_s, matrix,
-                                   params.gap_open, params.gap_extend, params.x_drop_final);
-            if gh.score > hsp.score {
-                let evalue = ka.evalue(gh.score, eff_query_len, eff_db_len);
-                let query_aln = crate::db::sequence::decode_protein(&gh.query_aln);
-                let subject_aln = crate::db::sequence::decode_protein(&gh.subject_aln);
-                *hsp = Hsp {
-                    score: gh.score, bit_score: ka.bit_score(gh.score), evalue,
-                    query_start: gh.q_start, query_end: gh.q_end,
-                    subject_start: gh.s_start, subject_end: gh.s_end,
-                    num_identities: gh.num_identities, num_gaps: gh.num_gaps,
-                    alignment_length: gh.query_aln.len(),
-                    query_aln, midline: gh.midline, subject_aln,
-                    query_frame: 0, subject_frame: 0,
-                };
-            }
-        }
     }
 
     hsps.sort_by(|a, b| a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal));

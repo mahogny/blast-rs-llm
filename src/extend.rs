@@ -183,6 +183,111 @@ pub fn gapped_extend(
     }
 }
 
+/// Score-only gapped extension (no traceback, no alignment strings).
+/// Used for preliminary gapped extension to quickly reject low-scoring hits.
+#[allow(clippy::too_many_arguments)]
+pub fn gapped_extend_score_only(
+    query: &[u8],
+    subject: &[u8],
+    q_center: usize,
+    s_center: usize,
+    matrix: &ScoringMatrix,
+    gap_open: i32,
+    gap_extend: i32,
+    x_drop: i32,
+) -> i32 {
+    let right = extend_score_only(&query[q_center..], &subject[s_center..],
+                                   matrix, gap_open, gap_extend, x_drop);
+    let query_rev: Vec<u8> = query[..q_center].iter().rev().cloned().collect();
+    let subject_rev: Vec<u8> = subject[..s_center].iter().rev().cloned().collect();
+    let left = extend_score_only(&query_rev, &subject_rev,
+                                  matrix, gap_open, gap_extend, x_drop);
+    left + right
+}
+
+/// Score-only one-direction extension. No traceback array, no alignment strings.
+fn extend_score_only(
+    query: &[u8],
+    subject: &[u8],
+    matrix: &ScoringMatrix,
+    gap_open: i32,
+    gap_extend: i32,
+    x_drop: i32,
+) -> i32 {
+    let qlen = query.len();
+    let slen = subject.len();
+    if qlen == 0 || slen == 0 { return 0; }
+
+    const NEG_INF: i32 = i32::MIN / 2;
+    let cols = slen + 1;
+
+    let profile: Vec<[i32; 28]> = query.iter().map(|&q| {
+        let mut row = [matrix.min_score; 28];
+        for r in 0u8..28 { row[r as usize] = matrix.score(q, r); }
+        row
+    }).collect();
+
+    let mut h_prev = vec![NEG_INF; cols];
+    let mut h_curr = vec![NEG_INF; cols];
+    let mut e_curr = vec![NEG_INF; cols];
+    let mut f_prev = vec![NEG_INF; cols];
+    let mut f_curr = vec![NEG_INF; cols];
+
+    h_prev[0] = 0;
+    let mut best_score = 0i32;
+    let mut j_lo: usize = 1;
+    let mut j_hi: usize = cols;
+
+    for i in 1..=qlen {
+        let q_profile = &profile[i - 1];
+
+        h_curr.fill(NEG_INF);
+        e_curr.fill(NEG_INF);
+        f_curr.fill(NEG_INF);
+
+        let mut row_has_valid = false;
+        let mut new_j_lo = j_hi;
+        let mut new_j_hi = j_lo;
+
+        let j_start = if j_lo > 1 { j_lo - 1 } else { 1 };
+        let j_end = (j_hi + 1).min(cols);
+
+        for j in j_start..j_end {
+            let diag = h_prev[j - 1];
+            let s = q_profile[subject[j - 1] as usize % 28];
+            let match_score = if diag == NEG_INF { NEG_INF } else { diag + s };
+
+            let h_left = if j > 0 { h_curr[j - 1] } else { NEG_INF };
+            let e_left = if j > 0 { e_curr[j - 1] } else { NEG_INF };
+            e_curr[j] = (if h_left == NEG_INF { NEG_INF } else { h_left - gap_open - gap_extend })
+                .max(if e_left == NEG_INF { NEG_INF } else { e_left - gap_extend });
+
+            let h_up = h_prev[j];
+            let f_up = f_prev[j];
+            f_curr[j] = (if h_up == NEG_INF { NEG_INF } else { h_up - gap_open - gap_extend })
+                .max(if f_up == NEG_INF { NEG_INF } else { f_up - gap_extend });
+
+            let cell_score = match_score.max(e_curr[j]).max(f_curr[j]);
+
+            if cell_score >= best_score - x_drop {
+                h_curr[j] = cell_score;
+                if cell_score > best_score { best_score = cell_score; }
+                row_has_valid = true;
+                if j < new_j_lo { new_j_lo = j; }
+                if j + 1 > new_j_hi { new_j_hi = j + 1; }
+            }
+        }
+
+        if !row_has_valid { break; }
+        j_lo = new_j_lo;
+        j_hi = new_j_hi;
+        std::mem::swap(&mut h_prev, &mut h_curr);
+        std::mem::swap(&mut f_prev, &mut f_curr);
+    }
+
+    best_score
+}
+
 struct DirectionResult {
     score: i32,
     query_len: usize,
