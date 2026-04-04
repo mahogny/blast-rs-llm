@@ -1013,6 +1013,8 @@ pub fn dc_megablast_search(
         if seed_hits.is_empty() { return None; }
 
         let nt_matrix = build_nt_matrix(params.match_score, params.mismatch);
+        let query_2bit: Vec<u8> = query.iter().map(|&b| nt_to_2bit(b)).collect();
+        let subject_2bit: Vec<u8> = subject.iter().map(|&b| nt_to_2bit(b)).collect();
         let mut hsps = Vec::new();
         let diag_offset = query.len();
         let mut diag_hit = vec![false; query.len() + subject.len() + 1];
@@ -1030,12 +1032,15 @@ pub fn dc_megablast_search(
 
                 let center_q = (hit.q_start + hit.q_end) / 2;
                 let center_s = (hit.s_start + hit.s_end) / 2;
-                let gh = gapped_extend(query, &subject, center_q, center_s, &nt_matrix,
+                let gh = gapped_extend(&query_2bit, &subject_2bit, center_q, center_s, &nt_matrix,
                     params.gap_open, params.gap_extend, params.x_drop_gapped);
                 if gh.score <= 0 { continue; }
 
                 let evalue = ka.evalue(gh.score, eff_query_len, eff_db_len);
                 if evalue > params.evalue_threshold { continue; }
+
+                let query_aln = gh.query_aln.iter().map(|&b| bit2_to_ascii(b)).collect();
+                let subject_aln = gh.subject_aln.iter().map(|&b| bit2_to_ascii(b)).collect();
 
                 hsps.push(Hsp {
                     score: gh.score, bit_score: ka.bit_score(gh.score), evalue,
@@ -1043,7 +1048,7 @@ pub fn dc_megablast_search(
                     subject_start: gh.s_start, subject_end: gh.s_end,
                     num_identities: gh.num_identities, num_gaps: gh.num_gaps,
                     alignment_length: gh.query_aln.len(),
-                    query_aln: gh.query_aln, midline: gh.midline, subject_aln: gh.subject_aln,
+                    query_aln, midline: gh.midline, subject_aln,
                     query_frame: 0, subject_frame: 0,
                 });
             }
