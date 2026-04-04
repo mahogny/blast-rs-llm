@@ -206,6 +206,7 @@ pub fn gapped_extend_score_only(
 }
 
 /// Score-only one-direction extension. No traceback array, no alignment strings.
+/// Uses branchless arithmetic and separated loops to enable auto-vectorization.
 fn extend_score_only(
     query: &[u8],
     subject: &[u8],
@@ -220,6 +221,7 @@ fn extend_score_only(
 
     const NEG_INF: i32 = i32::MIN / 2;
     let cols = slen + 1;
+    let gap_open_extend = gap_open + gap_extend;
 
     let profile: Vec<[i32; 28]> = query.iter().map(|&q| {
         let mut row = [matrix.min_score; 28];
@@ -227,11 +229,15 @@ fn extend_score_only(
         row
     }).collect();
 
+    // Precompute subject residue indices to avoid repeated modulo in inner loop
+    let subj_idx: Vec<usize> = subject.iter().map(|&b| (b as usize) % 28).collect();
+
     let mut h_prev = vec![NEG_INF; cols];
     let mut h_curr = vec![NEG_INF; cols];
     let mut e_curr = vec![NEG_INF; cols];
     let mut f_prev = vec![NEG_INF; cols];
     let mut f_curr = vec![NEG_INF; cols];
+    let mut diag_scores = vec![NEG_INF; cols];
 
     h_prev[0] = 0;
     let mut best_score = 0i32;
@@ -241,46 +247,49 @@ fn extend_score_only(
     for i in 1..=qlen {
         let q_profile = &profile[i - 1];
 
-        h_curr.fill(NEG_INF);
-        e_curr.fill(NEG_INF);
-        f_curr.fill(NEG_INF);
-
-        let mut row_has_valid = false;
-        let mut new_j_lo = j_hi;
-        let mut new_j_hi = j_lo;
-
         let j_start = if j_lo > 1 { j_lo - 1 } else { 1 };
         let j_end = (j_hi + 1).min(cols);
 
+        // Reset current row arrays
+        h_curr[..j_end].fill(NEG_INF);
+        e_curr[..j_end].fill(NEG_INF);
+
+        // Step 1: Compute F values — depends only on previous row (auto-vectorizable)
         for j in j_start..j_end {
-            let diag = h_prev[j - 1];
-            let s = q_profile[subject[j - 1] as usize % 28];
-            let match_score = if diag == NEG_INF { NEG_INF } else { diag + s };
+            f_curr[j] = (h_prev[j] - gap_open_extend).max(f_prev[j] - gap_extend);
+        }
 
-            let h_left = if j > 0 { h_curr[j - 1] } else { NEG_INF };
-            let e_left = if j > 0 { e_curr[j - 1] } else { NEG_INF };
-            e_curr[j] = (if h_left == NEG_INF { NEG_INF } else { h_left - gap_open - gap_extend })
-                .max(if e_left == NEG_INF { NEG_INF } else { e_left - gap_extend });
+        // Step 2: Compute diagonal match scores (auto-vectorizable)
+        for j in j_start..j_end {
+            diag_scores[j] = h_prev[j - 1] + q_profile[subj_idx[j - 1]];
+        }
 
-            let h_up = h_prev[j];
-            let f_up = f_prev[j];
-            f_curr[j] = (if h_up == NEG_INF { NEG_INF } else { h_up - gap_open - gap_extend })
-                .max(if f_up == NEG_INF { NEG_INF } else { f_up - gap_extend });
+        // Step 3: Sequential left-to-right sweep for E and H
+        let mut row_has_valid = false;
+        let mut new_j_lo = j_end;
+        let mut new_j_hi = j_start;
+        let drop_threshold = best_score - x_drop;
 
-            let cell_score = match_score.max(e_curr[j]).max(f_curr[j]);
+        for j in j_start..j_end {
+            e_curr[j] = (h_curr[j - 1] - gap_open_extend).max(e_curr[j - 1] - gap_extend);
 
-            if cell_score >= best_score - x_drop {
+            let cell_score = diag_scores[j].max(e_curr[j]).max(f_curr[j]);
+
+            if cell_score >= drop_threshold {
                 h_curr[j] = cell_score;
                 if cell_score > best_score { best_score = cell_score; }
                 row_has_valid = true;
                 if j < new_j_lo { new_j_lo = j; }
-                if j + 1 > new_j_hi { new_j_hi = j + 1; }
+                new_j_hi = j + 1;
+            } else {
+                h_curr[j] = NEG_INF;
             }
         }
 
         if !row_has_valid { break; }
         j_lo = new_j_lo;
         j_hi = new_j_hi;
+
         std::mem::swap(&mut h_prev, &mut h_curr);
         std::mem::swap(&mut f_prev, &mut f_curr);
     }
@@ -321,15 +330,13 @@ fn extend_one_direction(
     }
 
     // Banded X-drop DP with traceback.
-    // Only columns within the active band [j_lo, j_hi] are computed per row.
-    // The band shrinks from the left when cells drop below X-drop threshold
-    // and extends rightward only as far as cells remain viable.
-    // This reduces effective complexity from O(m*n) to O(m*W) where W is band width.
+    // The inner loop is split into vectorizable (F, diagonal scores) and sequential (E, H) phases.
+    // Branchless arithmetic enables LLVM auto-vectorization of the independent loops.
     const NEG_INF: i32 = i32::MIN / 2;
     let rows = qlen + 1;
     let cols = slen + 1;
+    let gap_open_extend = gap_open + gap_extend;
 
-    // Precompute query score profile
     let profile: Vec<[i32; 28]> = query.iter().map(|&q| {
         let mut row = [matrix.min_score; 28];
         for r in 0u8..28 {
@@ -338,13 +345,14 @@ fn extend_one_direction(
         row
     }).collect();
 
-    // Use two-row rolling storage for h, e, f (saves memory for long sequences).
-    // Traceback still needs full matrix.
+    let subj_idx: Vec<usize> = subject.iter().map(|&b| (b as usize) % 28).collect();
+
     let mut h_prev = vec![NEG_INF; cols];
     let mut h_curr = vec![NEG_INF; cols];
     let mut e_curr = vec![NEG_INF; cols];
     let mut f_prev = vec![NEG_INF; cols];
     let mut f_curr = vec![NEG_INF; cols];
+    let mut diag_scores = vec![NEG_INF; cols];
     let mut tb = vec![0u8; rows * cols];
 
     h_prev[0] = 0;
@@ -353,55 +361,44 @@ fn extend_one_direction(
     let mut best_i = 0usize;
     let mut best_j = 0usize;
 
-    // Active band: [j_lo, j_hi) — only iterate these columns per row
     let mut j_lo: usize = 1;
-    let mut j_hi: usize = cols; // start unbounded, will shrink
+    let mut j_hi: usize = cols;
 
     for i in 1..rows {
         let q_profile = &profile[i - 1];
 
-        // Reset current row
-        h_curr.fill(NEG_INF);
-        e_curr.fill(NEG_INF);
-        f_curr.fill(NEG_INF);
-
-        let mut row_has_valid = false;
-        let mut new_j_lo = j_hi; // will be set to first valid j
-        let mut new_j_hi = j_lo; // will be set to last valid j + 1
-
-        // Extend j_lo leftward by 1 to allow gaps from diagonal, but not below 1
         let j_start = if j_lo > 1 { j_lo - 1 } else { 1 };
-        // Extend j_hi rightward by 1 to allow gap opening
         let j_end = (j_hi + 1).min(cols);
 
+        // Reset current row arrays
+        h_curr[..j_end].fill(NEG_INF);
+        e_curr[..j_end].fill(NEG_INF);
+
+        // Step 1: Compute F values — depends only on previous row (auto-vectorizable)
         for j in j_start..j_end {
-            let diag = h_prev[j - 1];
-            let s = q_profile[subject[j - 1] as usize % 28];
-            let match_score = if diag == NEG_INF { NEG_INF } else { diag + s };
+            f_curr[j] = (h_prev[j] - gap_open_extend).max(f_prev[j] - gap_extend);
+        }
 
-            // E[i][j] = max(H[i][j-1] - gap_open - gap_extend, E[i][j-1] - gap_extend)
-            let h_left = if j > 0 { h_curr[j - 1] } else { NEG_INF };
-            let e_left = if j > 0 { e_curr[j - 1] } else { NEG_INF };
-            let from_h_e = if h_left == NEG_INF { NEG_INF } else { h_left - gap_open - gap_extend };
-            let from_e_e = if e_left == NEG_INF { NEG_INF } else { e_left - gap_extend };
-            e_curr[j] = from_h_e.max(from_e_e);
+        // Step 2: Compute diagonal match scores (auto-vectorizable)
+        for j in j_start..j_end {
+            diag_scores[j] = h_prev[j - 1] + q_profile[subj_idx[j - 1]];
+        }
 
-            // F[i][j] = max(H[i-1][j] - gap_open - gap_extend, F[i-1][j] - gap_extend)
-            let h_up = h_prev[j];
-            let f_up = f_prev[j];
-            let from_h_f = if h_up == NEG_INF { NEG_INF } else { h_up - gap_open - gap_extend };
-            let from_f_f = if f_up == NEG_INF { NEG_INF } else { f_up - gap_extend };
-            f_curr[j] = from_h_f.max(from_f_f);
+        // Step 3: Sequential left-to-right sweep for E, H, and traceback
+        let mut row_has_valid = false;
+        let mut new_j_lo = j_end;
+        let mut new_j_hi = j_start;
+        let drop_threshold = best_score - x_drop;
 
-            let cell_score = match_score.max(e_curr[j]).max(f_curr[j]);
+        for j in j_start..j_end {
+            e_curr[j] = (h_curr[j - 1] - gap_open_extend).max(e_curr[j - 1] - gap_extend);
+
+            let cell_score = diag_scores[j].max(e_curr[j]).max(f_curr[j]);
 
             let tb_idx = i * cols + j;
-            if cell_score < best_score - x_drop {
-                // Pruned
-                tb[tb_idx] = 0;
-            } else {
+            if cell_score >= drop_threshold {
                 h_curr[j] = cell_score;
-                if cell_score == match_score {
+                if cell_score == diag_scores[j] {
                     tb[tb_idx] = 1;
                 } else if cell_score == e_curr[j] {
                     tb[tb_idx] = 3;
@@ -417,18 +414,20 @@ fn extend_one_direction(
 
                 row_has_valid = true;
                 if j < new_j_lo { new_j_lo = j; }
-                if j + 1 > new_j_hi { new_j_hi = j + 1; }
+                new_j_hi = j + 1;
+            } else {
+                h_curr[j] = NEG_INF;
+                tb[tb_idx] = 0;
             }
         }
 
         if !row_has_valid {
-            break; // Entire row pruned — no point continuing
+            break;
         }
 
         j_lo = new_j_lo;
         j_hi = new_j_hi;
 
-        // Swap rows
         std::mem::swap(&mut h_prev, &mut h_curr);
         std::mem::swap(&mut f_prev, &mut f_curr);
     }
