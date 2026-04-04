@@ -81,7 +81,7 @@ impl SearchParams {
             two_hit: true,
             two_hit_window: 40,
             x_drop_final: 25,
-            soft_masking: false,
+            soft_masking: true,
             lcase_masking: false,
         }
     }
@@ -389,6 +389,18 @@ fn search_one_protein(
 
         let evalue = ka.evalue(gh.score, eff_query_len, eff_db_len);
         if evalue > params.evalue_threshold { continue; }
+
+        // Check if the gapped result substantially overlaps an existing HSP
+        // (query region overlap > 50% of the shorter alignment)
+        let dominated = hsps.iter().any(|existing: &Hsp| {
+            let ov_start = gh.q_start.max(existing.query_start);
+            let ov_end = gh.q_end.min(existing.query_end);
+            if ov_end <= ov_start { return false; }
+            let overlap = ov_end - ov_start;
+            let shorter = (gh.q_end - gh.q_start).min(existing.query_end - existing.query_start);
+            overlap * 2 > shorter
+        });
+        if dominated { continue; }
 
         let bit_score = ka.bit_score(gh.score);
 
