@@ -302,24 +302,24 @@ Measured on synthetic protein databases (sequences ~300aa). Both tools find the 
 
 | Query | DB size | NCBI BLAST+ | blast-rs | Ratio | Hits |
 |-------|---------|-------------|----------|-------|------|
-| 50aa  | 100     | 0.05 s      | 0.01 s   | **0.2x (5x faster)** | 5 |
-| 50aa  | 1,000   | 0.06 s      | 0.03 s   | **0.5x (2x faster)** | 5 |
-| 50aa  | 10,000  | 0.10 s      | 0.11 s   | 1.1x (parity)  | 5 |
-| 300aa | 100     | 0.05 s      | 0.02 s   | **0.4x (2.5x faster)** | 5 |
-| 300aa | 1,000   | 0.07 s      | 0.06 s   | **0.9x (parity)** | 5 |
-| 300aa | 10,000  | 0.24 s      | 0.23 s   | 1.0x (parity)  | 5 |
-| 1000aa| 100     | 0.08 s      | 0.04 s   | **0.5x (2x faster)** | 20 |
-| 1000aa| 1,000   | 0.12 s      | 0.08 s   | **0.7x (1.5x faster)** | 20 |
-| 1000aa| 10,000  | 0.52 s      | 0.31 s   | **0.6x (1.7x faster)** | 20 |
+| 50aa  | 100     | 0.06 s      | 0.01 s   | **0.2x (5x faster)** | 5 |
+| 50aa  | 1,000   | 0.07 s      | 0.04 s   | **0.6x** | 5 |
+| 50aa  | 10,000  | 0.11 s      | 0.11 s   | 1.0x (parity)  | 5 |
+| 300aa | 100     | 0.07 s      | 0.02 s   | **0.3x (3x faster)** | 5 |
+| 300aa | 1,000   | 0.08 s      | 0.08 s   | 1.0x (parity) | 5 |
+| 300aa | 10,000  | 0.24 s      | 0.33 s   | 1.4x   | 5 |
+| 1000aa| 100     | 0.08 s      | 0.06 s   | **0.8x** | 20 |
+| 1000aa| 1,000   | 0.12 s      | 0.14 s   | 1.2x   | 20 |
+| 1000aa| 10,000  | 0.64 s      | 0.74 s   | 1.2x   | 20 |
 
 **Multi-threaded scaling (1000aa query, 10,000 seq DB):**
 
 | Threads | NCBI BLAST+ | blast-rs | Ratio |
 |---------|-------------|----------|-------|
-| 1       | 0.52 s      | 0.31 s   | **0.6x** |
-| 2       | 0.32 s      | 0.18 s   | **0.6x** |
-| 4       | 0.22 s      | 0.12 s   | **0.5x** |
-| 8       | 0.16 s      | 0.09 s   | **0.6x** |
+| 1       | 0.64 s      | 0.74 s   | 1.2x  |
+| 2       | 0.32 s      | 0.42 s   | 1.3x  |
+| 4       | 0.21 s      | 0.26 s   | 1.2x  |
+| 8       | 0.16 s      | 0.16 s   | **1.0x (parity)** |
 
 **Memory usage (blast-rs uses 4-8x less):**
 
@@ -327,7 +327,7 @@ Measured on synthetic protein databases (sequences ~300aa). Both tools find the 
 |--|-------------|----------|
 | Typical | 36-39 MB | 5-10 MB |
 
-blast-rs matches or exceeds NCBI BLAST+ performance across all tested configurations while using 4-8x less memory. Both tools produce identical hit counts
+blast-rs is faster than NCBI BLAST+ for small/medium databases and within 1.2x for large databases (10,000 sequences). The gap closes to parity with multi-threading. Memory usage is 4-8x lower. Both tools produce identical hit counts
 
 ## License
 

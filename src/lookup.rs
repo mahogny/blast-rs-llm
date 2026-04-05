@@ -5,11 +5,11 @@ use crate::matrix::ScoringMatrix;
 /// NCBI-style backbone cell: stores up to 3 hits inline to avoid
 /// pointer dereference for the common case (single cache line access).
 #[derive(Clone, Copy)]
-struct BackboneCell {
+pub struct BackboneCell {
     /// Number of hits: 0 = empty, 1-3 = inline, >3 = overflow
-    num_used: u32,
+    pub num_used: u32,
     /// Inline storage for up to 3 query positions, or overflow cursor
-    data: [u32; 3],
+    pub data: [u32; 3],
 }
 
 /// Protein lookup table using neighboring words.
@@ -24,11 +24,11 @@ pub struct ProteinLookup {
     pub charsize: u32,
     pub mask: u32,
     /// Presence bitfield for quick rejection (~4 KB, L1-resident)
-    presence: Vec<u64>,
+    pub presence: Vec<u64>,
     /// Backbone: one cell per possible word code. Most accesses are single cache line.
-    backbone: Vec<BackboneCell>,
+    pub backbone: Vec<BackboneCell>,
     /// Overflow array for words with >3 hits
-    overflow: Vec<u32>,
+    pub overflow: Vec<u32>,
     #[allow(dead_code)]
     capacity: usize,
 }

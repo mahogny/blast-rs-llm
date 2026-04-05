@@ -367,8 +367,6 @@ struct SearchScratch {
     /// Offset added to subject positions to distinguish entries from different subjects.
     /// Incremented by (max_subject_len + window + 1) after each subject.
     diag_offset: i32,
-    /// Batch of (query_offset, subject_offset) hit pairs from scanning.
-    offset_pairs: Vec<(u32, u32)>,
     ungapped_hits: Vec<(i32, usize, usize, usize, usize)>,
     covered_query: Vec<bool>,
 }
@@ -379,7 +377,6 @@ impl SearchScratch {
             diag_array: Vec::new(),
             diag_mask: 0,
             diag_offset: 0,
-            offset_pairs: Vec::new(),
             ungapped_hits: Vec::new(),
             covered_query: Vec::new(),
         }
@@ -438,7 +435,6 @@ fn search_one_protein_scratch(
     let ws = lookup.word_size;
     if slen < ws { return vec![]; }
 
-    let num_words = slen - ws + 1;
     let cutoff = ungapped_cutoff;
     let x_drop = params.x_drop_ungapped;
     let diag_mask = scratch.diag_mask;
@@ -450,86 +446,22 @@ fn search_one_protein_scratch(
 
     scratch.ungapped_hits.clear();
 
-    // Phase 1: Batch scan with shift-based rolling hash (NCBI ComputeTableIndexIncremental)
-    scratch.offset_pairs.clear();
-    {
-        // Prime the index (NCBI: ComputeTableIndex)
-        let mut code = 0u32;
-        for &r in subject.iter().take(ws) {
-            code = (code << charsize) | (r as u32 & 0x1F);
-        }
-        let hits = lookup.get_hits(code);
-        for &q_pos in hits {
-            scratch.offset_pairs.push((q_pos, 0));
-        }
-        // Incremental index (NCBI: ComputeTableIndexIncremental)
-        for s_pos in 1..num_words {
-            code = ((code << charsize) | (subject[s_pos + ws - 1] as u32 & 0x1F)) & mask;
-            let hits = lookup.get_hits(code);
-            if hits.is_empty() { continue; }
-            let s = s_pos as u32;
-            for &q_pos in hits {
-                scratch.offset_pairs.push((q_pos, s));
-            }
-        }
-    }
-
-    if scratch.offset_pairs.is_empty() {
-        scratch.advance_offset(slen, params.two_hit_window);
-        return vec![];
-    }
-
-    // Phase 2: Process hits with NCBI-style diagonal tracking
+    // Dispatch to specialized scanning functions (NCBI splits these too).
+    // Separate functions keep instruction footprint small for icache.
     if params.two_hit {
-        for i in 0..scratch.offset_pairs.len() {
-            let (q_off, s_off) = scratch.offset_pairs[i];
-            let q_pos = q_off as usize;
-            let s_pos = s_off as usize;
-            let diag_coord = q_pos.wrapping_sub(s_pos) & diag_mask;
-            let entry = scratch.diag_array[diag_coord];
-            let s_with_offset = s_off as i32 + diag_offset;
-
-            if entry.flag() {
-                // Already extended on this diagonal
-                if s_with_offset < entry.last_hit() { continue; }
-                scratch.diag_array[diag_coord] = DiagEntry::new(s_with_offset, false);
-            } else {
-                let last_hit = entry.last_hit() - diag_offset;
-                let diff = s_off as i32 - last_hit;
-
-                if diff >= window || diff < 0 {
-                    scratch.diag_array[diag_coord] = DiagEntry::new(s_with_offset, false);
-                    continue;
-                }
-                if diff < ws as i32 { continue; }
-
-                // Two hits within window — extend
-                let hit = ungapped_extend_inline(query, subject, q_pos, s_pos, score_profile, x_drop);
-                if hit.0 >= cutoff {
-                    scratch.ungapped_hits.push(hit);
-                    scratch.diag_array[diag_coord] = DiagEntry::new(hit.4 as i32 + diag_offset, true);
-                } else {
-                    scratch.diag_array[diag_coord] = DiagEntry::new(s_with_offset, false);
-                }
-            }
-        }
+        scan_two_hit(
+            subject, lookup, score_profile, x_drop, cutoff,
+            charsize, mask, ws, diag_mask, diag_offset, window,
+            &mut scratch.diag_array, &mut scratch.ungapped_hits,
+            query,
+        );
     } else {
-        for i in 0..scratch.offset_pairs.len() {
-            let (q_off, s_off) = scratch.offset_pairs[i];
-            let q_pos = q_off as usize;
-            let s_pos = s_off as usize;
-            let diag_coord = q_pos.wrapping_sub(s_pos) & diag_mask;
-            let entry = scratch.diag_array[diag_coord];
-            let s_with_offset = s_off as i32 + diag_offset;
-
-            if entry.flag() && s_with_offset < entry.last_hit() { continue; }
-
-            let hit = ungapped_extend_inline(query, subject, q_pos, s_pos, score_profile, x_drop);
-            if hit.0 >= cutoff {
-                scratch.diag_array[diag_coord] = DiagEntry::new(hit.4 as i32 + diag_offset, true);
-                scratch.ungapped_hits.push(hit);
-            }
-        }
+        scan_one_hit(
+            subject, lookup, score_profile, x_drop, cutoff,
+            charsize, mask, ws, diag_mask, diag_offset,
+            &mut scratch.diag_array, &mut scratch.ungapped_hits,
+            query,
+        );
     }
 
     scratch.advance_offset(slen, params.two_hit_window);
@@ -603,11 +535,248 @@ fn search_one_protein_scratch(
     hsps
 }
 
-/// Inline ungapped extension matching NCBI's s_BlastAaExtendTwoHit behavior.
-/// First scans word_size positions from the seed to find the best starting point,
-/// then extends left and right from that refined position.
+/// Two-hit scanning: faithful port of NCBI's s_BlastAaWordFinder_TwoHit.
+/// Kept as a separate function for icache efficiency.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn scan_two_hit(
+    subject: &[u8],
+    lookup: &crate::lookup::ProteinLookup,
+    score_profile: &[[i32; 28]],
+    x_drop: i32,
+    cutoff: i32,
+    charsize: u32,
+    mask: u32,
+    ws: usize,
+    diag_mask: usize,
+    diag_offset: i32,
+    window: i32,
+    diag_array: &mut [DiagEntry],
+    ungapped_hits: &mut Vec<(i32, usize, usize, usize, usize)>,
+    query: &[u8],
+) {
+    let slen = subject.len();
+    let num_words = slen - ws + 1;
+    let ws_i32 = ws as i32;
+
+    unsafe {
+        let subj_ptr = subject.as_ptr();
+        let diag_arr = diag_array.as_mut_ptr();
+        let pv_ptr = lookup.presence.as_ptr();
+        let bb_ptr = lookup.backbone.as_ptr();
+        let ovfl_ptr = lookup.overflow.as_ptr();
+        let prof_ptr = score_profile.as_ptr();
+
+        let mut code = 0u32;
+        for i in 0..ws {
+            code = (code << charsize) | (*subj_ptr.add(i) as u32 & 0x1F);
+        }
+
+        for s_pos in 0..num_words {
+            if s_pos > 0 {
+                code = ((code << charsize) | (*subj_ptr.add(s_pos + ws - 1) as u32 & 0x1F)) & mask;
+            }
+
+            let pv_word = *pv_ptr.add((code as usize) >> 6);
+            if pv_word & (1u64 << (code & 63)) == 0 { continue; }
+
+            let cell = &*bb_ptr.add(code as usize);
+            let n = cell.num_used as usize;
+            if n == 0 { continue; }
+
+            let (hits_ptr, hits_len) = if n <= 3 {
+                (cell.data.as_ptr(), n)
+            } else {
+                (ovfl_ptr.add(cell.data[0] as usize), n)
+            };
+
+            let s_off_i32 = s_pos as i32;
+            let s_with_offset = s_off_i32 + diag_offset;
+
+            // NCBI-style hit processing: minimize branches using combined conditions.
+            // The flag+last_hit are packed in a single u32, enabling branchless comparisons.
+            for h in 0..hits_len {
+                let q_pos = *hits_ptr.add(h) as usize;
+                let diag_coord = q_pos.wrapping_sub(s_pos) & diag_mask;
+                let dc = diag_arr.add(diag_coord);
+                let entry = *dc;
+
+                // Combined check: if flag is set and we haven't passed the last_hit, skip.
+                // If flag is set but we HAVE passed, start new hit.
+                if entry.flag() {
+                    if s_with_offset < entry.last_hit() { continue; }
+                    *dc = DiagEntry::new(s_with_offset, false);
+                    continue;
+                }
+
+                // Not flagged: check two-hit window
+                let diff = s_off_i32 - (entry.last_hit() - diag_offset);
+
+                // Record new hit if outside window or first hit on diagonal
+                if (diff as u32) >= (window as u32) {
+                    // Covers diff >= window AND diff < 0 (negative wraps to large u32)
+                    *dc = DiagEntry::new(s_with_offset, false);
+                    continue;
+                }
+
+                if diff < ws_i32 { continue; }
+
+                // Two hits within window — extend
+                let hit = ungapped_extend_unsafe(
+                    query, subject, q_pos, s_pos, prof_ptr, x_drop,
+                );
+                if hit.0 >= cutoff {
+                    ungapped_hits.push(hit);
+                    *dc = DiagEntry::new(hit.4 as i32 + diag_offset, true);
+                } else {
+                    *dc = DiagEntry::new(s_with_offset, false);
+                }
+            }
+        }
+    }
+}
+
+/// One-hit scanning: faithful port of NCBI's s_BlastAaWordFinder_OneHit.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn scan_one_hit(
+    subject: &[u8],
+    lookup: &crate::lookup::ProteinLookup,
+    score_profile: &[[i32; 28]],
+    x_drop: i32,
+    cutoff: i32,
+    charsize: u32,
+    mask: u32,
+    ws: usize,
+    diag_mask: usize,
+    diag_offset: i32,
+    diag_array: &mut [DiagEntry],
+    ungapped_hits: &mut Vec<(i32, usize, usize, usize, usize)>,
+    query: &[u8],
+) {
+    let slen = subject.len();
+    let num_words = slen - ws + 1;
+
+    unsafe {
+        let subj_ptr = subject.as_ptr();
+        let diag_arr = diag_array.as_mut_ptr();
+        let pv_ptr = lookup.presence.as_ptr();
+        let bb_ptr = lookup.backbone.as_ptr();
+        let ovfl_ptr = lookup.overflow.as_ptr();
+        let prof_ptr = score_profile.as_ptr();
+
+        let mut code = 0u32;
+        for i in 0..ws {
+            code = (code << charsize) | (*subj_ptr.add(i) as u32 & 0x1F);
+        }
+
+        for s_pos in 0..num_words {
+            if s_pos > 0 {
+                code = ((code << charsize) | (*subj_ptr.add(s_pos + ws - 1) as u32 & 0x1F)) & mask;
+            }
+
+            let pv_word = *pv_ptr.add((code as usize) >> 6);
+            if pv_word & (1u64 << (code & 63)) == 0 { continue; }
+
+            let cell = &*bb_ptr.add(code as usize);
+            let n = cell.num_used as usize;
+            if n == 0 { continue; }
+
+            let (hits_ptr, hits_len) = if n <= 3 {
+                (cell.data.as_ptr(), n)
+            } else {
+                (ovfl_ptr.add(cell.data[0] as usize), n)
+            };
+
+            let s_with_offset = s_pos as i32 + diag_offset;
+
+            for h in 0..hits_len {
+                let q_pos = *hits_ptr.add(h) as usize;
+                let diag_coord = q_pos.wrapping_sub(s_pos) & diag_mask;
+                let entry = *diag_arr.add(diag_coord);
+
+                if entry.flag() && s_with_offset < entry.last_hit() { continue; }
+
+                let hit = ungapped_extend_unsafe(
+                    query, subject, q_pos, s_pos, prof_ptr, x_drop,
+                );
+                if hit.0 >= cutoff {
+                    *diag_arr.add(diag_coord) = DiagEntry::new(hit.4 as i32 + diag_offset, true);
+                    ungapped_hits.push(hit);
+                }
+            }
+        }
+    }
+}
+
+/// Raw pointer ungapped extension — faithful port of NCBI's s_BlastAaExtendRight/Left.
+/// All bounds are pre-validated by the caller; inner loops use pure pointer arithmetic.
+#[inline(always)]
+unsafe fn ungapped_extend_unsafe(
+    query: &[u8], subject: &[u8], q_pos: usize, s_pos: usize,
+    prof_ptr: *const [i32; 28], x_drop: i32,
+) -> (i32, usize, usize, usize, usize) {
+    let qlen = query.len();
+    let slen = subject.len();
+    let s_ptr = subject.as_ptr();
+
+    // Word scan: find best start within word_size=3 positions
+    let ws = 3usize;
+    let scan_end = ws.min(qlen - q_pos).min(slen - s_pos);
+    let mut scan_score = 0i32;
+    let mut best_scan = 0i32;
+    let mut right_d = 0usize;
+    for i in 0..scan_end {
+        let row = &*prof_ptr.add(q_pos + i);
+        scan_score += row[*s_ptr.add(s_pos + i) as usize];
+        if scan_score > best_scan {
+            best_scan = scan_score;
+            right_d = i + 1;
+        }
+    }
+
+    let eq = q_pos + right_d;
+    let es = s_pos + right_d;
+
+    // Extend left (NCBI s_BlastAaExtendLeft)
+    let n_left = eq.min(es);
+    let mut score = 0i32;
+    let mut maxscore = 0i32;
+    let mut best_left = 0usize;
+    for i in 1..=n_left {
+        let row = &*prof_ptr.add(eq - i);
+        score += row[*s_ptr.add(es - i) as usize];
+        if score > maxscore {
+            maxscore = score;
+            best_left = i;
+        }
+        if maxscore - score >= x_drop { break; }
+    }
+    let left_score = maxscore;
+
+    // Extend right (NCBI s_BlastAaExtendRight)
+    let n_right = (qlen - eq).min(slen - es);
+    score = 0;
+    maxscore = 0;
+    let mut best_right = 0usize;
+    for i in 0..n_right {
+        let row = &*prof_ptr.add(eq + i);
+        score += row[*s_ptr.add(es + i) as usize];
+        if score > maxscore {
+            maxscore = score;
+            best_right = i + 1;
+        }
+        if score <= 0 || maxscore - score >= x_drop { break; }
+    }
+
+    (left_score + maxscore, eq - best_left, eq + best_right, es - best_left, es + best_right)
+}
+
+/// Inline ungapped extension matching NCBI's s_BlastAaExtendTwoHit/Right/Left.
+/// Uses unsafe pointer access to match NCBI's performance (no bounds checks in hot loop).
 /// Returns (score, q_start, q_end, s_start, s_end).
 #[inline]
+#[allow(dead_code)]
 fn ungapped_extend_inline(
     query: &[u8], subject: &[u8], q_pos: usize, s_pos: usize,
     score_profile: &[[i32; 28]], x_drop: i32,
@@ -615,65 +784,70 @@ fn ungapped_extend_inline(
     let slen = subject.len();
     let qlen = query.len();
 
-    // NCBI word-scan: find best starting position within word_size positions
-    // from the seed (matches s_BlastAaExtendTwoHit lines 1104-1121)
-    let ws = 3usize; // word_size
+    // NCBI word-scan: find best starting position within word (lines 1104-1121)
+    let ws = 3usize;
     let mut scan_score = 0i32;
     let mut best_scan = 0i32;
     let mut right_d = 0usize;
     let scan_end = ws.min(qlen - q_pos).min(slen - s_pos);
     for i in 0..scan_end {
-        scan_score += score_profile[q_pos + i][subject[s_pos + i] as usize];
+        scan_score += unsafe {
+            *score_profile.get_unchecked(q_pos + i).get_unchecked(
+                *subject.get_unchecked(s_pos + i) as usize
+            )
+        };
         if scan_score > best_scan {
             best_scan = scan_score;
             right_d = i + 1;
         }
     }
 
-    // Refined starting position (one beyond the best word position)
     let ext_q = q_pos + right_d;
     let ext_s = s_pos + right_d;
 
-    // Extend left from refined position
+    // Extend left (NCBI s_BlastAaExtendLeft pattern: pointer arithmetic, no bounds check)
+    let n_left = ext_q.min(ext_s);
     let mut best = 0i32;
-    let mut best_q_start = ext_q;
-    let mut best_s_start = ext_s;
     let mut score = 0i32;
-    let mut qi = ext_q;
-    let mut si = ext_s;
-    while qi > 0 && si > 0 {
-        qi -= 1;
-        si -= 1;
-        score += score_profile[qi][subject[si] as usize];
+    let mut best_i = 0usize;
+    for i in 1..=n_left {
+        score += unsafe {
+            *score_profile.get_unchecked(ext_q - i).get_unchecked(
+                *subject.get_unchecked(ext_s - i) as usize
+            )
+        };
         if score > best {
             best = score;
-            best_q_start = qi;
-            best_s_start = si;
+            best_i = i;
         } else if best - score > x_drop {
             break;
         }
     }
     let left_score = best;
+    let best_q_start = ext_q - best_i;
+    let best_s_start = ext_s - best_i;
 
-    // Extend right from refined position
-    qi = ext_q;
-    si = ext_s;
+    // Extend right (NCBI s_BlastAaExtendRight pattern)
+    let n_right = (qlen - ext_q).min(slen - ext_s);
     score = 0;
     best = 0;
-    let mut best_q_end = ext_q;
-    let mut best_s_end = ext_s;
-    while qi < qlen && si < slen {
-        score += score_profile[qi][subject[si] as usize];
+    best_i = 0;
+    for i in 0..n_right {
+        score += unsafe {
+            *score_profile.get_unchecked(ext_q + i).get_unchecked(
+                *subject.get_unchecked(ext_s + i) as usize
+            )
+        };
         if score > best {
             best = score;
-            best_q_end = qi + 1;
-            best_s_end = si + 1;
-        } else if best - score > x_drop {
+            best_i = i + 1;
+        }
+        if score <= 0 || best - score >= x_drop {
             break;
         }
-        qi += 1;
-        si += 1;
     }
+    let best_q_end = ext_q + best_i;
+    let best_s_end = ext_s + best_i;
 
     (left_score + best, best_q_start, best_q_end, best_s_start, best_s_end)
 }
