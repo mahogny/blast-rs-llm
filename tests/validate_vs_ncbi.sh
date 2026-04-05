@@ -85,6 +85,46 @@ nt_queries.append(("q_homolog_1", mutate(nt_db[0][1][:500], 0.05)))
 nt_queries.append(("q_homolog_2", mutate(nt_db[5][1][:500], 0.05)))
 write_fasta(os.path.join(outdir, "nt_query.fna"), nt_queries)
 
+# For blastx/tblastn: create protein queries from translated DB sequences
+# and nucleotide queries that encode known proteins
+codon_table = {
+    'A':'GCT','C':'TGT','D':'GAT','E':'GAA','F':'TTT','G':'GGT','H':'CAT',
+    'I':'ATT','K':'AAA','L':'CTG','M':'ATG','N':'AAT','P':'CCT','Q':'CAA',
+    'R':'CGT','S':'TCT','T':'ACT','V':'GTT','W':'TGG','Y':'TAT'
+}
+# Translate first 3 DB nucleotide seqs → protein for tblastn queries
+tblastn_queries = []
+for i in range(3):
+    nt_seq = nt_db[i][1]
+    prot = ''
+    for j in range(0, len(nt_seq)-2, 3):
+        c = nt_seq[j:j+3]
+        # Simple translation
+        idx = {'A':0,'C':1,'G':2,'T':3}
+        if all(b in idx for b in c):
+            aa_idx = idx[c[0]]*16 + idx[c[1]]*4 + idx[c[2]]
+            aa_table = 'KNKNTTTTRSRSIIMIQHQHPPPPRRRRLLLLEDEDAAAAGGGGVVVV*Y*YSSSS*CWCLFLF'
+            prot += aa_table[aa_idx]
+        else:
+            prot += 'X'
+    # Take first 100aa, skip stop codons
+    prot = prot.replace('*', '')[:100]
+    tblastn_queries.append((f"tbn_q_{i+1}", mutate(prot, 0.10)))
+write_fasta(os.path.join(outdir, "tblastn_query.faa"), tblastn_queries)
+
+# Reverse-translate first 3 DB protein seqs → nucleotide for blastx queries
+blastx_queries = []
+for i in range(3):
+    prot_seq = db_seqs[i][1][:100]
+    nt_seq = ''.join(codon_table.get(c, 'NNN') for c in prot_seq)
+    # Mutate at nucleotide level
+    nt_mut = list(nt_seq)
+    for j in range(len(nt_mut)):
+        if random.random() < 0.05:
+            nt_mut[j] = random.choice(list('ACGT'))
+    blastx_queries.append((f"bx_q_{i+1}", ''.join(nt_mut)))
+write_fasta(os.path.join(outdir, "blastx_query.fna"), blastx_queries)
+
 print("Test data generated.")
 PYEOF
 
@@ -506,6 +546,90 @@ elif (( $(echo "$mask_agree >= 80" | bc -l 2>/dev/null || echo 0) )); then
     warn "Section 9: Masking behavior (shared=$mask_shared, ncbi=$mask_ncbi, rs=$mask_rs, agree=${mask_agree}%)"
 else
     fail "Section 9: Masking behavior (shared=$mask_shared, ncbi=$mask_ncbi, rs=$mask_rs, agree=${mask_agree}%)"
+fi
+
+# ── Section 10: BLASTX (translated query vs protein DB) ──────────────────────
+
+# Translated searches on random data produce very marginal hits — use looser evalue
+TRANS_EVALUE=10.0
+
+blastx -query "$TMPDIR/blastx_query.fna" -db "$TMPDIR/ncbi_prot" \
+    -outfmt 6 -evalue "$TRANS_EVALUE" -seg no -comp_based_stats 0 -num_threads 1 \
+    > "$TMPDIR/ncbi_blastx.tsv" 2>/dev/null || true
+
+"$BLAST_RS" blastx -q "$TMPDIR/blastx_query.fna" --db "$TMPDIR/rs_prot" \
+    --outfmt 6 --evalue "$TRANS_EVALUE" --no-lc-filter --no-comp-adjust --num_threads 1 \
+    > "$TMPDIR/rs_blastx.tsv" 2>/dev/null || true
+
+bx_ncbi=$(awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/ncbi_blastx.tsv" 2>/dev/null | sort -u | wc -l | tr -d ' ')
+bx_rs=$(awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/rs_blastx.tsv" 2>/dev/null | sort -u | wc -l | tr -d ' ')
+bx_shared=$(comm -12 \
+    <(awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/ncbi_blastx.tsv" 2>/dev/null | sort -u) \
+    <(awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/rs_blastx.tsv" 2>/dev/null | sort -u) \
+    | wc -l | tr -d ' ')
+
+if [ "$bx_ncbi" -eq 0 ] && [ "$bx_rs" -eq 0 ]; then
+    pass "Section 10: BLASTX (both tools: 0 hits)"
+elif [ "$bx_shared" -eq "$bx_ncbi" ] && [ "$bx_shared" -eq "$bx_rs" ] && [ "$bx_shared" -gt 0 ]; then
+    pass "Section 10: BLASTX ($bx_shared hits, 100% overlap)"
+elif [ "$bx_shared" -gt 0 ]; then
+    warn "Section 10: BLASTX (shared=$bx_shared, ncbi=$bx_ncbi, rs=$bx_rs)"
+else
+    fail "Section 10: BLASTX (shared=$bx_shared, ncbi=$bx_ncbi, rs=$bx_rs)"
+fi
+
+# ── Section 11: TBLASTN (protein query vs translated nt DB) ──────────────────
+
+tblastn -query "$TMPDIR/tblastn_query.faa" -db "$TMPDIR/ncbi_nt" \
+    -outfmt 6 -evalue "$TRANS_EVALUE" -seg no -comp_based_stats 0 -num_threads 1 \
+    > "$TMPDIR/ncbi_tblastn.tsv" 2>/dev/null || true
+
+"$BLAST_RS" tblastn -q "$TMPDIR/tblastn_query.faa" --db "$TMPDIR/rs_nt" \
+    --outfmt 6 --evalue "$TRANS_EVALUE" --no-lc-filter --no-comp-adjust --num_threads 1 \
+    > "$TMPDIR/rs_tblastn.tsv" 2>/dev/null || true
+
+tb_ncbi=$(awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/ncbi_tblastn.tsv" 2>/dev/null | sort -u | wc -l | tr -d ' ')
+tb_rs=$(awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/rs_tblastn.tsv" 2>/dev/null | sort -u | wc -l | tr -d ' ')
+tb_shared=$(comm -12 \
+    <(awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/ncbi_tblastn.tsv" 2>/dev/null | sort -u) \
+    <(awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/rs_tblastn.tsv" 2>/dev/null | sort -u) \
+    | wc -l | tr -d ' ')
+
+if [ "$tb_ncbi" -eq 0 ] && [ "$tb_rs" -eq 0 ]; then
+    pass "Section 11: TBLASTN (both tools: 0 hits)"
+elif [ "$tb_shared" -eq "$tb_ncbi" ] && [ "$tb_shared" -eq "$tb_rs" ] && [ "$tb_shared" -gt 0 ]; then
+    pass "Section 11: TBLASTN ($tb_shared hits, 100% overlap)"
+elif [ "$tb_shared" -gt 0 ]; then
+    warn "Section 11: TBLASTN (shared=$tb_shared, ncbi=$tb_ncbi, rs=$tb_rs)"
+else
+    fail "Section 11: TBLASTN (shared=$tb_shared, ncbi=$tb_ncbi, rs=$tb_rs)"
+fi
+
+# ── Section 12: Composition-based statistics ─────────────────────────────────
+
+blastp -query "$TMPDIR/prot_query.faa" -db "$TMPDIR/ncbi_prot" \
+    -outfmt 6 -evalue "$STRICT_EVALUE" -seg no -num_threads 1 \
+    > "$TMPDIR/ncbi_comp.tsv" 2>/dev/null || true
+
+"$BLAST_RS" blastp -q "$TMPDIR/prot_query.faa" --db "$TMPDIR/rs_prot" \
+    --outfmt 6 --evalue "$STRICT_EVALUE" --no-lc-filter --num_threads 1 \
+    > "$TMPDIR/rs_comp.tsv" 2>/dev/null || true
+
+comp_ncbi=$(awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/ncbi_comp.tsv" 2>/dev/null | sort -u | wc -l | tr -d ' ')
+comp_rs=$(awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/rs_comp.tsv" 2>/dev/null | sort -u | wc -l | tr -d ' ')
+comp_shared=$(comm -12 \
+    <(awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/ncbi_comp.tsv" 2>/dev/null | sort -u) \
+    <(awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/rs_comp.tsv" 2>/dev/null | sort -u) \
+    | wc -l | tr -d ' ')
+
+if [ "$comp_ncbi" -eq 0 ] && [ "$comp_rs" -eq 0 ]; then
+    pass "Section 12: Composition stats (both tools: 0 hits with comp_adjust on)"
+elif [ "$comp_shared" -eq "$comp_ncbi" ] && [ "$comp_shared" -eq "$comp_rs" ]; then
+    pass "Section 12: Composition stats ($comp_shared hits, 100% overlap with comp_adjust)"
+elif [ "$comp_shared" -gt 0 ]; then
+    warn "Section 12: Composition stats (shared=$comp_shared, ncbi=$comp_ncbi, rs=$comp_rs)"
+else
+    fail "Section 12: Composition stats (shared=$comp_shared, ncbi=$comp_ncbi, rs=$comp_rs)"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────

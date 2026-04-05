@@ -590,6 +590,11 @@ fn run_blastp(args: &BlastArgs) {
             results.retain(|r| f.contains(&r.subject_oid));
         }
 
+        // JSON comma separator between multi-query entries
+        if fmt.fmt_id == 15 && iter_num > 0 {
+            writeln!(out, ",").unwrap();
+        }
+
         let ctx = output::SearchContext {
             program: "blastp",
             db_path: &db_path,
@@ -710,6 +715,7 @@ fn run_blastn(args: &BlastArgs) {
     let filter = build_oid_filter(&db, args);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
+        if fmt.fmt_id == 15 && iter_num > 0 { writeln!(out, ",").unwrap(); }
         let mut results = if use_dc {
             let tt = args.template_type.unwrap_or(0);
             let tl = args.template_length.unwrap_or(21);
@@ -849,6 +855,7 @@ fn run_blastx(args: &BlastArgs) {
     let filter = build_oid_filter(&db, args);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
+        if fmt.fmt_id == 15 && iter_num > 0 { writeln!(out, ",").unwrap(); }
         let mut results = api_blastx(&db, query_seq, &params);
         if let Some(ref f) = filter {
             results.retain(|r| f.contains(&r.subject_oid));
@@ -926,6 +933,7 @@ fn run_tblastn(args: &BlastArgs) {
     let filter = build_oid_filter(&db, args);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
+        if fmt.fmt_id == 15 && iter_num > 0 { writeln!(out, ",").unwrap(); }
         let mut results = api_tblastn(&db, query_seq, &params);
         if let Some(ref f) = filter {
             results.retain(|r| f.contains(&r.subject_oid));
@@ -998,6 +1006,7 @@ fn run_tblastx(args: &BlastArgs) {
     let filter = build_oid_filter(&db, args);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
+        if fmt.fmt_id == 15 && iter_num > 0 { writeln!(out, ",").unwrap(); }
         let mut results = api_tblastx(&db, query_seq, &params);
         if let Some(ref f) = filter {
             results.retain(|r| f.contains(&r.subject_oid));
@@ -1054,6 +1063,7 @@ fn run_psiblast(args: &PsiblastArgs) {
         .inclusion_evalue(args.inclusion_ethresh);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
+        if fmt.fmt_id == 15 && iter_num > 0 { writeln!(out, ",").unwrap(); }
         let (results, pssm) = api_psiblast(&db, query_seq, &psi_params);
         let ctx = output::SearchContext {
             program: "psiblast", db_path: &db_path, db_title: &db_title,
