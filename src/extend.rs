@@ -436,17 +436,6 @@ pub fn gapped_extend(
     midline.extend_from_slice(&right.midline);
     subject_aln.extend_from_slice(&right.subject_aln);
 
-    // Trim alignment to maximal-scoring sub-segment.
-    // This removes leading/trailing mismatches that reduce the alignment score,
-    // matching NCBI BLAST+'s behavior of reporting only the highest-scoring
-    // contiguous sub-alignment.
-    let (query_aln, midline, subject_aln, q_start, q_end, s_start, s_end) =
-        trim_alignment_to_max_score(
-            query_aln, midline, subject_aln,
-            q_start, q_end, s_start, s_end,
-            matrix, gap_open, gap_extend,
-        );
-
     let num_identities = midline.iter().filter(|&&c| c == b'|').count();
     let num_gaps = query_aln.iter().filter(|&&c| c == b'-').count()
         + subject_aln.iter().filter(|&&c| c == b'-').count();
