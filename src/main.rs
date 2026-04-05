@@ -296,6 +296,9 @@ struct MakeDbArgs {
     /// Database format version (4 or 5)
     #[arg(long, default_value = "4")]
     dbversion: u32,
+    /// Maximum file size in bytes before splitting into volumes (0 = no splitting)
+    #[arg(long = "max-file-size", default_value = "0")]
+    max_file_size: u64,
 }
 
 #[derive(clap::Args)]
@@ -1190,7 +1193,12 @@ fn run_makeblastdb(args: &MakeDbArgs) {
         builder.add(SequenceEntry { title, accession, sequence: seq, taxid: None });
     }
 
-    if args.dbversion == 5 {
+    if args.max_file_size > 0 {
+        builder.write_multivolume(&args.out, args.dbversion as i32, args.max_file_size).unwrap_or_else(|e| {
+            eprintln!("Error writing database: {}", e);
+            std::process::exit(1);
+        });
+    } else if args.dbversion == 5 {
         builder.write_v5(&args.out).unwrap_or_else(|e| {
             eprintln!("Error writing database: {}", e);
             std::process::exit(1);

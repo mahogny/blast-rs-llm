@@ -2,6 +2,14 @@
 name = "blast-rs"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Unlicense"
+description = "Pure-Rust implementation of NCBI BLAST (Basic Local Alignment Search Tool)"
+repository = "https://github.com/henriksson-lab/blast-rs"
+homepage = "https://github.com/henriksson-lab/blast-rs"
+keywords = ["bioinformatics", "blast", "alignment", "sequence", "genomics"]
+categories = ["science", "command-line-utilities"]
+readme = "README.md"
+rust-version = "1.82"
 
 [[bin]]
 name = "blast-cli"

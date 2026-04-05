@@ -1,8 +1,11 @@
 # blast-rs
 
-A pure-Rust implementation of BLAST (Basic Local Alignment Search Tool). Reads and writes databases created by NCBI `makeblastdb`, implements the core BLAST algorithm for protein and nucleotide search, and produces output in all standard BLAST formats.
+A pure-Rust implementation of BLAST (Basic Local Alignment Search Tool). Reads and writes databases created by NCBI `makeblastdb`, implements the core BLAST algorithm for protein and nucleotide search, and produces output in all standard BLAST formats. No dependency on the NCBI C++ toolkit.
 
-No dependency on the NCBI C++ toolkit.
+This implementation passes many tests, showing similiar behavior to the original BLAST. Further randomized testing would however be beneficial
+
+The aim of this code is to offer a stable version that can be called as a library. It is however currently up to 20% slower than regular BLAST. Further optimization is needed to fully replace BLAST
+
 
 ## Features
 
@@ -14,29 +17,21 @@ No dependency on the NCBI C++ toolkit.
 - All standard BLAST output formats (0–18)
 - Custom tabular column selection
 
-## Workspace layout
+## Using blast-rs as a library
 
-```
-blast-db/     library: database reader and writer
-blast-core/   library: search algorithm, statistics, scoring matrices
-blast-cli/    binary: blast-cli (blastp, blastn, makeblastdb, dumpdb)
-```
-
-## Using blast-core as a library
-
-`blast-core` exposes a high-level Rust API so you can embed BLAST searches in your own program without shelling out to the CLI.
+`blast-rs` exposes a high-level Rust API so you can embed BLAST searches in your own program without shelling out to the CLI.
 
 Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-blast-core = { path = "blast-core" }
+blast-rs = { git = "https://github.com/henriksson-lab/blast-rs" }
 ```
 
 ### Protein search (blastp)
 
 ```rust
-use blast_core::{BlastDb, SearchParams, blastp, parse_fasta};
+use blast_rs::{BlastDb, SearchParams, blastp, parse_fasta};
 
 fn main() -> anyhow::Result<()> {
     let db = BlastDb::open("mydb".as_ref())?;
@@ -62,7 +57,7 @@ fn main() -> anyhow::Result<()> {
 ### Nucleotide search (blastn)
 
 ```rust
-use blast_core::{BlastDb, SearchParams, blastn};
+use blast_rs::{BlastDb, SearchParams, blastn};
 
 let db = BlastDb::open("nt".as_ref())?;
 let params = SearchParams::blastn()
@@ -77,7 +72,7 @@ let results = blastn(&db, b"ATGCGTACGTAGCTAGC", &params);
 ### Translated search (blastx / tblastn / tblastx)
 
 ```rust
-use blast_core::{BlastDb, SearchParams, blastx, tblastn, tblastx};
+use blast_rs::{BlastDb, SearchParams, blastx, tblastn, tblastx};
 
 // Nucleotide query vs protein database (6-frame translation of query)
 let results = blastx(&db, nt_query, &SearchParams::blastx().evalue(1e-5));
@@ -92,23 +87,23 @@ let results = tblastx(&db, nt_query, &SearchParams::tblastx());
 ### Iterative search with PSSM (psiblast)
 
 ```rust
-use blast_core::{BlastDb, SearchParams, psiblast, PsiblastParams};
+use blast_rs::{BlastDb, SearchParams, psiblast, PsiblastParams};
 
 let db = BlastDb::open("mydb".as_ref())?;
-let search = SearchParams::blastp().evalue(10.0).matrix(blast_core::MatrixType::Blosum62);
+let search = SearchParams::blastp().evalue(10.0).matrix(blast_rs::MatrixType::Blosum62);
 
 let params = PsiblastParams::new(search)
     .num_iterations(3)
     .inclusion_evalue(0.001);
 
 let (results, pssm) = psiblast(&db, b"MKTLLLTLVV...", &params);
-// `pssm` can be used for subsequent custom searches via `blast_core::search_with_pssm`
+// `pssm` can be used for subsequent custom searches via `blast_rs::search_with_pssm`
 ```
 
 ### Parsing FASTA in memory
 
 ```rust
-use blast_core::parse_fasta;
+use blast_rs::parse_fasta;
 
 let input = std::fs::read("sequences.faa")?;
 for (title, seq) in parse_fasta(&input) {
@@ -337,4 +332,4 @@ blast-rs is faster than NCBI BLAST+ for small/medium databases and within 1.2x f
 
 ## License
 
-MIT
+Dual-licensed under MIT or Public Domain (Unlicense), at your option. See [LICENSE](LICENSE).

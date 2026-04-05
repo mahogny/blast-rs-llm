@@ -3,22 +3,43 @@
 //! and OID→TaxIDs (.pot/.not) files.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use byteorder::{BigEndian, LittleEndian, WriteBytesExt};
 use lmdb::{self, DatabaseFlags, Environment, EnvironmentFlags, Transaction, WriteFlags};
 use crate::db::error::{DbError, Result};
 use crate::db::index::SeqType;
 
-/// One sequence to be added to the database.
+/// One sequence to be added to a BLAST database.
+///
+/// The `sequence` field should contain raw ASCII bytes — amino acids (A-Z) for protein,
+/// nucleotides (A/C/G/T/N) for nucleotide. The builder handles encoding internally.
 pub struct SequenceEntry {
+    /// Full description (e.g., "Human insulin precursor").
     pub title: String,
+    /// Accession identifier (e.g., "P01308").
     pub accession: String,
     /// Raw ASCII sequence bytes (uppercase preferred).
     pub sequence: Vec<u8>,
+    /// NCBI taxonomy ID (e.g., 9606 for human). Optional.
     pub taxid: Option<u32>,
 }
 
-/// Accumulates sequences and writes a v4 BLAST database.
+/// Builder for creating BLAST databases from sequences.
+///
+/// Supports v4 and v5 formats, single and multi-volume output.
+///
+/// ```no_run
+/// use blast_rs::{BlastDbBuilder, SequenceEntry};
+/// use blast_rs::db::index::SeqType;
+/// use std::path::Path;
+///
+/// let mut builder = BlastDbBuilder::new(SeqType::Protein, "My DB");
+/// builder.add(SequenceEntry {
+///     title: "test".into(), accession: "P001".into(),
+///     sequence: b"MKFLILLF".to_vec(), taxid: None,
+/// });
+/// builder.write(Path::new("mydb")).unwrap();
+/// ```
 pub struct BlastDbBuilder {
     pub seq_type: SeqType,
     pub db_title: String,
@@ -40,6 +61,95 @@ impl BlastDbBuilder {
             SeqType::Protein    => self.write_protein(base_path, 4),
             SeqType::Nucleotide => self.write_nucleotide(base_path, 4),
         }
+    }
+
+    /// Write a multi-volume database, splitting when sequence data exceeds `max_file_size` bytes.
+    /// Creates `.00`, `.01`, ... volume files plus a `.pal`/`.nal` alias file.
+    /// If all data fits in one volume, writes a single-volume database (no alias).
+    pub fn write_multivolume(&self, base_path: &Path, format_version: i32, max_file_size: u64) -> Result<()> {
+        if self.entries.is_empty() {
+            return if format_version == 5 { self.write_v5(base_path) } else { self.write(base_path) };
+        }
+
+        // Split entries into volumes based on cumulative sequence size
+        let mut volumes: Vec<(usize, usize)> = Vec::new(); // (start_idx, end_idx) inclusive
+        let mut vol_start = 0;
+        let mut vol_bytes = 0u64;
+
+        for (i, entry) in self.entries.iter().enumerate() {
+            let entry_size = entry.sequence.len() as u64 + 1; // +1 for NUL terminator
+            if vol_bytes + entry_size > max_file_size && i > vol_start {
+                volumes.push((vol_start, i));
+                vol_start = i;
+                vol_bytes = 0;
+            }
+            vol_bytes += entry_size;
+        }
+        volumes.push((vol_start, self.entries.len()));
+
+        // Single volume — no alias needed
+        if volumes.len() == 1 {
+            return if format_version == 5 { self.write_v5(base_path) } else { self.write(base_path) };
+        }
+
+        // Write each volume with .00, .01, ... suffix.
+        // NCBI uses mydb.00.pin, mydb.00.psq etc. Since Rust's with_extension replaces
+        // everything after the last dot, we write to a temp name then rename the files.
+        let mut vol_names = Vec::new();
+        let base_str = base_path.to_string_lossy().to_string();
+        let base_dir = base_path.parent().unwrap_or(Path::new("."));
+        for (vi, &(start, end)) in volumes.iter().enumerate() {
+            let vol_suffix = format!("{:02}", vi);
+
+            // Create sub-builder for this volume
+            let mut vol_builder = BlastDbBuilder::new(self.seq_type, &self.db_title);
+            for entry in &self.entries[start..end] {
+                vol_builder.add(SequenceEntry {
+                    title: entry.title.clone(),
+                    accession: entry.accession.clone(),
+                    sequence: entry.sequence.clone(),
+                    taxid: entry.taxid,
+                });
+            }
+
+            // Write to a temp path without dots in the stem, then rename
+            let temp_path = base_dir.join(format!("__vol_tmp_{}", vi));
+            if format_version == 5 {
+                vol_builder.write_v5(&temp_path)?;
+            } else {
+                vol_builder.write(&temp_path)?;
+            }
+
+            // Rename files: __vol_tmp_0.pin → mydb.00.pin etc.
+            let exts: &[&str] = match self.seq_type {
+                SeqType::Protein    => &["pin", "psq", "phr", "pdb", "pos", "pot"],
+                SeqType::Nucleotide => &["nin", "nsq", "nhr", "ndb", "nos", "not"],
+            };
+            for ext in exts {
+                let src = temp_path.with_extension(ext);
+                if src.exists() {
+                    let dst = PathBuf::from(format!("{}.{}.{}", base_str, vol_suffix, ext));
+                    fs::rename(&src, &dst)?;
+                }
+            }
+
+            vol_names.push(format!("{}.{}",
+                base_path.file_name().unwrap_or_default().to_string_lossy(), vol_suffix));
+        }
+
+        // Write alias file (.pal or .nal)
+        let alias_ext = match self.seq_type {
+            SeqType::Protein    => "pal",
+            SeqType::Nucleotide => "nal",
+        };
+        let alias_content = format!(
+            "#\n# Alias file created by blast-rs\n#\nTITLE {}\nDBLIST {}\n",
+            self.db_title,
+            vol_names.join(" "),
+        );
+        fs::write(base_path.with_extension(alias_ext), alias_content)?;
+
+        Ok(())
     }
 
     /// Write a v5 database: sequence/header/index files (format_version=5) plus

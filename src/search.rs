@@ -13,6 +13,22 @@ use crate::translate::{six_frame_translate_with_code, strip_stops, TranslatedFra
 use crate::compo::{composition_ncbistdaa, adjust_evalue_with_mode};
 
 /// Parameters for a BLAST search.
+///
+/// Use the preset constructors for sensible defaults:
+/// - [`SearchParams::blastp()`] — protein vs protein
+/// - [`SearchParams::blastn()`] — nucleotide vs nucleotide
+/// - [`SearchParams::blastx()`] — translated nucleotide vs protein
+/// - [`SearchParams::tblastn()`] — protein vs translated nucleotide
+/// - [`SearchParams::tblastx()`] — translated vs translated
+///
+/// Then chain builder methods to customize:
+/// ```
+/// use blast_rs::SearchParams;
+/// let params = SearchParams::blastp()
+///     .evalue(1e-5)
+///     .max_target_seqs(100)
+///     .num_threads(4);
+/// ```
 #[derive(Debug, Clone)]
 pub struct SearchParams {
     pub word_size: usize,
@@ -183,18 +199,15 @@ fn ungapped_ka_params(matrix: MatrixType) -> (f64, f64) {
     }
 }
 
+/// Neighbor word threshold for the lookup table.
+/// NCBI uses a default of 11 for word_size=3 across all protein matrices
+/// (BLAST_WORD_THRESHOLD_BLASTP). Some matrices use slightly adjusted values.
 pub(crate) fn neighbor_threshold(matrix: MatrixType, word_size: usize) -> i32 {
     match (matrix, word_size) {
-        (MatrixType::Blosum62, 3) => 11,
-        (MatrixType::Blosum62, 2) => 8,
+        (_, 2) => 8,
         (MatrixType::Blosum45, 3) => 14,
         (MatrixType::Blosum50, 3) => 13,
-        (MatrixType::Blosum80, 3) => 25,
-        (MatrixType::Blosum90, 3) => 27,
-        (MatrixType::Pam30, 3)    => 10,
-        (MatrixType::Pam70, 3)    => 11,
-        (MatrixType::Pam250, 3)   => 11,
-        _ => 11,
+        _ => 11, // NCBI default for word_size=3
     }
 }
 

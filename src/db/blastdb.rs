@@ -19,6 +19,18 @@ struct Volume {
     oid_taxids: Option<OidTaxIds>,
 }
 
+/// Handle to an open BLAST database (one or more volumes).
+///
+/// Supports v4 and v5 formats, single and multi-volume databases, and alias files.
+/// Database files are memory-mapped for efficient access.
+///
+/// ```no_run
+/// use blast_rs::BlastDb;
+/// use std::path::Path;
+///
+/// let db = BlastDb::open(Path::new("nr")).unwrap();
+/// println!("{} sequences, {} total residues", db.num_sequences(), db.volume_length());
+/// ```
 pub struct BlastDb {
     volumes: Vec<Volume>,
     /// Cumulative OID count per volume: volume i covers OIDs [cum_oids[i], cum_oids[i+1]).
@@ -31,12 +43,18 @@ pub struct BlastDb {
     db_format_version: i32,
 }
 
+/// Append ".ext" to a path string, handling dotted stems correctly.
+/// Unlike Path::with_extension, this always appends rather than replacing.
+fn path_with_ext(base: &Path, ext: &str) -> PathBuf {
+    PathBuf::from(format!("{}.{}", base.display(), ext))
+}
+
 impl BlastDb {
     /// Open a single volume from a base path (without extension).
     fn open_single_volume(path: &Path) -> Result<Volume> {
-        let (is_protein, index_ext, seq_ext, hdr_ext) = if path.with_extension("pin").exists() {
+        let (is_protein, index_ext, seq_ext, hdr_ext) = if path_with_ext(path, "pin").exists() {
             (true, "pin", "psq", "phr")
-        } else if path.with_extension("nin").exists() {
+        } else if path_with_ext(path, "nin").exists() {
             (false, "nin", "nsq", "nhr")
         } else {
             return Err(DbError::InvalidFormat(format!(
@@ -45,13 +63,13 @@ impl BlastDb {
             )));
         };
 
-        let index_data = fs::read(path.with_extension(index_ext))?;
+        let index_data = fs::read(path_with_ext(path, index_ext))?;
         let index = IndexFile::parse(&index_data)?;
 
-        let seq_file = fs::File::open(path.with_extension(seq_ext))?;
+        let seq_file = fs::File::open(path_with_ext(path, seq_ext))?;
         let seq_mmap = unsafe { Mmap::map(&seq_file)? };
 
-        let hdr_file = fs::File::open(path.with_extension(hdr_ext))?;
+        let hdr_file = fs::File::open(path_with_ext(path, hdr_ext))?;
         let hdr_mmap = unsafe { Mmap::map(&hdr_file)? };
 
         let (lmdb, oid_seqids, oid_taxids) = if index.format_version == 5 {
@@ -59,17 +77,17 @@ impl BlastDb {
                 if is_protein { ("pdb", "pos", "pot") }
                 else          { ("ndb", "nos", "not") };
 
-            let lmdb_path = path.with_extension(lmdb_ext);
+            let lmdb_path = path_with_ext(path, lmdb_ext);
             let lmdb = if lmdb_path.exists() {
                 Some(LmdbV5::open(&lmdb_path)?)
             } else { None };
 
-            let oid_seqids_path = path.with_extension(seqids_ext);
+            let oid_seqids_path = path_with_ext(path, seqids_ext);
             let oid_seqids = if oid_seqids_path.exists() {
                 Some(OidSeqIds::open(&oid_seqids_path)?)
             } else { None };
 
-            let oid_taxids_path = path.with_extension(taxids_ext);
+            let oid_taxids_path = path_with_ext(path, taxids_ext);
             let oid_taxids = if oid_taxids_path.exists() {
                 Some(OidTaxIds::open(&oid_taxids_path)?)
             } else { None };

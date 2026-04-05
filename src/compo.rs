@@ -4,7 +4,7 @@
 //! query and subject sequences, using the method of Schaffer et al. (2001).
 //!
 //! The core idea: find λ' such that
-//!     Σᵢⱼ qᵢ · rⱼ · exp(λ' · s[i][j]) = 1
+//!     `Σᵢⱼ qᵢ · rⱼ · exp(λ' · s(i,j)) = 1`
 //! where qᵢ and rⱼ are the per-sequence amino acid frequencies and s is the
 //! scoring matrix. Then use λ' instead of λ for the E-value computation.
 
@@ -94,7 +94,7 @@ fn expected_score(pq: &[f64; 28], rq: &[f64; 28], matrix: &ScoringMatrix) -> f64
     mu
 }
 
-/// Find λ' via bisection such that Σᵢⱼ pᵢ·rⱼ·exp(λ'·s[i][j]) = 1.
+/// Find λ' via bisection such that `Σᵢⱼ pᵢ·rⱼ·exp(λ'·s(i,j)) = 1`.
 ///
 /// Returns `None` if no positive λ' exists (e.g., the expected score is non-negative,
 /// meaning composition correction is not applicable).

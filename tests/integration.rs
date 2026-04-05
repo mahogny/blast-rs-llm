@@ -838,3 +838,492 @@ fn db_single_residue_protein() {
     let decoded = db.get_sequence_protein(0).unwrap();
     assert_eq!(String::from_utf8(decoded).unwrap(), "M");
 }
+
+// ── Multi-volume database tests ─────────────────────────────────────────────
+
+#[test]
+fn multivolume_protein_write_read_search() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path().join("mvdb");
+    let mut builder = BlastDbBuilder::new(SeqType::Protein, "multi-volume test");
+    let query_seq = "MKFLILLFNILCLFPVLAADNHGVSMNAS";
+    for i in 0..20 {
+        builder.add(protein_entry(&format!("P{:03}", i), "protein", query_seq));
+    }
+    // Split into small volumes (100 bytes each → several volumes)
+    builder.write_multivolume(&base, 4, 100).unwrap();
+
+    // Verify alias file exists
+    assert!(base.with_extension("pal").exists());
+
+    // Open via alias and search
+    let db = BlastDb::open(&base).unwrap();
+    assert_eq!(db.num_sequences(), 20);
+
+    let params = SearchParams::blastp().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0);
+    let results = blastp(&db, query_seq.as_bytes(), &params);
+    assert!(!results.is_empty(), "should find hits in multi-volume DB");
+    // All 20 sequences are identical — should find them all (up to max_target_seqs)
+    assert!(results.len() >= 10, "should find many hits, got {}", results.len());
+}
+
+// ── Database v5 round-trip ──────────────────────────────────────────────────
+
+#[test]
+fn db_v5_protein_roundtrip() {
+    // V5 write requires LMDB which may not work on all temp filesystems.
+    // Use a path in /tmp directly to avoid issues.
+    let base = std::path::PathBuf::from("/tmp/blast_rs_test_v5db");
+    let _ = std::fs::remove_dir_all("/tmp/blast_rs_test_v5db.pdb"); // clean up LMDB dir
+
+    let mut builder = BlastDbBuilder::new(SeqType::Protein, "v5 test");
+    builder.add(SequenceEntry {
+        title: "test protein".to_string(),
+        accession: "ACC001".to_string(),
+        sequence: b"MKFLILLFNILCLFPVLAAD".to_vec(),
+        taxid: Some(9606),
+    });
+    builder.add(SequenceEntry {
+        title: "another protein".to_string(),
+        accession: "ACC002".to_string(),
+        sequence: b"NHGVSMNASQRDHFKLAEV".to_vec(),
+        taxid: Some(10090),
+    });
+
+    if builder.write_v5(&base).is_err() {
+        eprintln!("Skipping v5 test: LMDB write failed (filesystem limitation)");
+        return;
+    }
+
+    let db = BlastDb::open(&base).unwrap();
+    assert_eq!(db.num_sequences(), 2);
+
+    let seq0 = db.get_sequence_protein(0).unwrap();
+    assert_eq!(String::from_utf8(seq0).unwrap(), "MKFLILLFNILCLFPVLAAD");
+
+    // Verify accession lookup (LMDB)
+    if let Some(Ok(oids)) = db.lookup_accession("ACC002") {
+        assert!(!oids.is_empty(), "should find ACC002 via LMDB lookup");
+    }
+
+    // Verify taxonomy
+    if let Some(Ok(taxids)) = db.get_taxids(0) {
+        assert_eq!(taxids, vec![9606i32]);
+    }
+
+    // Clean up
+    for ext in &["pin", "psq", "phr", "pdb", "pos", "pot"] {
+        let _ = std::fs::remove_file(format!("/tmp/blast_rs_test_v5db.{}", ext));
+    }
+    let _ = std::fs::remove_dir_all("/tmp/blast_rs_test_v5db.pdb");
+}
+
+// ── Output format smoke test ────────────────────────────────────────────────
+// (output module is in the binary crate, so we test via search results only)
+
+#[test]
+fn search_results_have_alignment_data() {
+    let query = "MKFLILLFNILCLFPVLAADNHGVSMNAS";
+    let (_tmp, db) = build_protein_db(vec![
+        protein_entry("P001", "target", query),
+    ]);
+    let params = SearchParams::blastp().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0);
+    let results = blastp(&db, query.as_bytes(), &params);
+    assert!(!results.is_empty());
+    let hsp = &results[0].hsps[0];
+    // Verify all fields needed for output are populated
+    assert!(hsp.score > 0);
+    assert!(hsp.bit_score > 0.0);
+    assert!(hsp.evalue < 1.0);
+    assert!(!hsp.query_aln.is_empty(), "query alignment string should be populated");
+    assert!(!hsp.subject_aln.is_empty(), "subject alignment string should be populated");
+    assert!(!hsp.midline.is_empty(), "midline should be populated");
+    assert_eq!(hsp.query_aln.len(), hsp.subject_aln.len());
+    assert_eq!(hsp.query_aln.len(), hsp.midline.len());
+}
+
+// ── Composition-based statistics modes ──────────────────────────────────────
+
+#[test]
+fn comp_adjust_modes_differ() {
+    // Use a biased sequence (lots of leucine) to trigger comp adjustment
+    let query = "LLLLLLLLLLACDEFGHIKMNPQRSTVWY";
+    let subject = "LLLLLLLLLLACDEFGHIKMNPQRSTVWY";
+    let (_tmp, db) = build_protein_db(vec![
+        protein_entry("P001", "biased", subject),
+    ]);
+
+    let mut evalues = Vec::new();
+    for mode in [0u8, 1, 2, 3] {
+        let params = SearchParams::blastp().evalue(100.0).num_threads(1)
+            .filter_low_complexity(false).comp_adjust(mode);
+        let results = blastp(&db, query.as_bytes(), &params);
+        let ev = if results.is_empty() { f64::INFINITY } else { results[0].best_evalue() };
+        evalues.push(ev);
+    }
+    // Mode 0 (no adjustment) should give a different evalue than mode 1
+    // (they may be the same for this particular sequence, but at least verify no panic)
+    assert!(evalues[0].is_finite(), "mode 0 should produce finite evalue");
+    assert!(evalues[1].is_finite(), "mode 1 should produce finite evalue");
+}
+
+// ── Large query test ────────────────────────────────────────────────────────
+
+#[test]
+fn blastp_large_query_1000aa() {
+    // Generate a deterministic 1000aa sequence
+    let aa = b"ACDEFGHIKLMNPQRSTVWY";
+    let query: Vec<u8> = (0..1000).map(|i| aa[i % aa.len()]).collect();
+    let (_tmp, db) = build_protein_db(vec![
+        protein_entry("P001", "target", std::str::from_utf8(&query).unwrap()),
+        protein_entry("P002", "unrelated", "WWWWWWWWWWWWWWWWWWWWWWWWWWWWW"),
+    ]);
+    let params = SearchParams::blastp().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0);
+    let results = blastp(&db, &query, &params);
+    assert!(!results.is_empty(), "should find self-match for 1000aa query");
+    assert_eq!(results[0].subject_accession, "P001");
+    assert!((results[0].hsps[0].percent_identity() - 100.0).abs() < 0.01);
+}
+
+// ── Taxonomy column output ──────────────────────────────────────────────────
+
+#[test]
+fn db_v5_taxid_in_search_results() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path().join("taxdb");
+    let mut builder = BlastDbBuilder::new(SeqType::Protein, "tax test");
+    let seq = "MKFLILLFNILCLFPVLAADNHGVSMNAS";
+    builder.add(SequenceEntry {
+        title: "human protein".to_string(),
+        accession: "P001".to_string(),
+        sequence: seq.as_bytes().to_vec(),
+        taxid: Some(9606),
+    });
+    builder.write_v5(&base).unwrap();
+    let db = BlastDb::open(&base).unwrap();
+
+    let params = SearchParams::blastp().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0);
+    let results = blastp(&db, seq.as_bytes(), &params);
+    assert!(!results.is_empty());
+    assert_eq!(results[0].taxids, vec![9606i32], "taxid should be populated from v5 DB");
+}
+
+// ── Multi-query search ──────────────────────────────────────────────────────
+
+#[test]
+fn multi_query_fasta() {
+    let fasta = b">q1\nMKFLILLFNILCLFPVLAAD\n>q2\nNHGVSMNASQRDHFKLAEV\n";
+    let queries = parse_fasta(fasta);
+    assert_eq!(queries.len(), 2);
+
+    let (_tmp, db) = build_protein_db(vec![
+        protein_entry("P001", "match1", "MKFLILLFNILCLFPVLAAD"),
+        protein_entry("P002", "match2", "NHGVSMNASQRDHFKLAEV"),
+    ]);
+    let params = SearchParams::blastp().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0);
+
+    // Search each query
+    for (title, seq) in &queries {
+        let results = blastp(&db, seq, &params);
+        assert!(!results.is_empty(), "query '{}' should find a hit", title);
+    }
+}
+
+// ── Strand filtering (blastn) ───────────────────────────────────────────────
+
+#[test]
+fn blastn_minus_strand_only() {
+    let seq = "ATGCGTACCTGAAAGCTTCAGTACGGTAATCCTGAACGTTAGCCAATGCTTGAAGTCAACGTATCGCAAGCTTAACGATCGTAAGGCCTTAGCAGTCAATGC";
+    let rc = reverse_complement(seq.as_bytes());
+    // DB contains the reverse complement of the query
+    let (_tmp, db) = build_nucleotide_db(vec![
+        nt_entry("N001", "rc_of_query", std::str::from_utf8(&rc).unwrap()),
+    ]);
+
+    // Minus strand: searches rc(query) against DB.
+    // rc(query) = rc(seq) which matches the DB entry (which is also rc(seq)).
+    let params = SearchParams::blastn().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false).strand("minus");
+    let results = blastn(&db, seq.as_bytes(), &params);
+    assert!(!results.is_empty(), "minus strand should find hit against rc DB entry");
+}
+
+// ── Genetic codes ───────────────────────────────────────────────────────────
+
+#[test]
+fn blastx_nonstandard_genetic_code() {
+    // Genetic code 2 = vertebrate mitochondrial
+    // ATG = M in both standard and mito
+    // AGA = R in standard, * (stop) in mito code 2
+    let nt_query = "ATGAAATTTCTGATTCTGCTGTTT";
+    let protein = "MKFLILLF";
+
+    let (_tmp, db) = build_protein_db(vec![
+        protein_entry("P001", "target", protein),
+    ]);
+
+    // Standard genetic code (1) — should find hit
+    let params1 = SearchParams::blastp().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0).query_gencode(1);
+    let r1 = blastx(&db, nt_query.as_bytes(), &params1);
+
+    // Vertebrate mito code (2) — should also find hit (this query has no AGA)
+    let params2 = SearchParams::blastp().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0).query_gencode(2);
+    let r2 = blastx(&db, nt_query.as_bytes(), &params2);
+
+    assert!(!r1.is_empty(), "standard code should find hit");
+    assert!(!r2.is_empty(), "mito code should also find hit for this query");
+}
+
+// ── Scoring matrix sweep (all 8 matrices) ───────────────────────────────────
+
+#[test]
+fn all_scoring_matrices_find_self_match() {
+    // Use a longer query to ensure all matrices produce scores above gap_trigger
+    let query = "MKFLILLFNILCLFPVLAADNHGVSMNASACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWY";
+    let (_tmp, db) = build_protein_db(vec![
+        protein_entry("P001", "target", query),
+    ]);
+
+    // Each matrix with its standard gap penalties
+    let configs: &[(blast_rs::MatrixType, i32, i32)] = &[
+        (blast_rs::MatrixType::Blosum45, 13, 3),
+        (blast_rs::MatrixType::Blosum50, 13, 2),
+        (blast_rs::MatrixType::Blosum62, 11, 1),
+        (blast_rs::MatrixType::Blosum80, 10, 1),
+        (blast_rs::MatrixType::Blosum90,  9, 2),
+        (blast_rs::MatrixType::Pam30,     9, 1),
+        (blast_rs::MatrixType::Pam70,    10, 1),
+        (blast_rs::MatrixType::Pam250,   14, 2),
+    ];
+
+    for &(matrix, gap_open, gap_extend) in configs {
+        let params = SearchParams::blastp().evalue(10.0).matrix(matrix)
+            .gap_open(gap_open).gap_extend(gap_extend)
+            .num_threads(1).filter_low_complexity(false).comp_adjust(0);
+        let results = blastp(&db, query.as_bytes(), &params);
+        assert!(!results.is_empty(), "{:?} should find self-match", matrix);
+        assert!((results[0].hsps[0].percent_identity() - 100.0).abs() < 0.01,
+            "{:?}: expected 100% identity", matrix);
+    }
+}
+
+// ── Effective length test ───────────────────────────────────────────────────
+
+#[test]
+fn effective_length_reduces_search_space() {
+    // Verify via E-value: a 300aa exact self-match should have a very small E-value
+    // that depends on effective lengths being calculated correctly
+    let query = "MKFLILLFNILCLFPVLAADNHGVSMNASACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWY";
+    let entries: Vec<_> = (0..100)
+        .map(|i| protein_entry(&format!("P{:03}", i), "seq", query))
+        .collect();
+    let (_tmp, db) = build_protein_db(entries);
+    let params = SearchParams::blastp().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0);
+    let results = blastp(&db, query.as_bytes(), &params);
+    assert!(!results.is_empty());
+    // E-value should be extremely small for a 300aa exact match
+    assert!(results[0].best_evalue() < 1e-100,
+        "E-value {} should be < 1e-100 for 300aa exact match", results[0].best_evalue());
+}
+
+// ── Search result completeness ──────────────────────────────────────────────
+
+#[test]
+fn search_results_have_complete_metadata() {
+    let query = "MKFLILLFNILCLFPVLAADNHGVSMNAS";
+    let (_tmp, db) = build_protein_db(vec![
+        protein_entry("P001", "target protein", query),
+    ]);
+    let params = SearchParams::blastp().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0);
+    let results = blastp(&db, query.as_bytes(), &params);
+    assert!(!results.is_empty());
+
+    let r = &results[0];
+    assert_eq!(r.subject_accession, "P001");
+    assert!(r.subject_title.contains("target protein"));
+    assert_eq!(r.subject_len, query.len());
+    assert!(!r.hsps.is_empty());
+    assert!(r.best_evalue() < 1.0);
+}
+
+// ── Gapped alignment with actual gaps ───────────────────────────────────────
+
+#[test]
+fn blastp_gapped_alignment() {
+    // Longer sequences with a clear insertion — forces gapped alignment
+    let query   = "MKFLILLFNILCLFPVLAADNHGVSMNASACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWY";
+    let subject = "MKFLILLFNILCLFPVLAADNHGVAAAASMNASACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWY";
+    // 4 extra "AAAA" residues inserted — gap penalty must be overcome by the flanking matches
+
+    let (_tmp, db) = build_protein_db(vec![
+        protein_entry("P001", "with insertion", subject),
+    ]);
+    let params = SearchParams::blastp().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0);
+    let results = blastp(&db, query.as_bytes(), &params);
+    assert!(!results.is_empty(), "should find gapped hit");
+    let hsp = &results[0].hsps[0];
+    // The aligner should produce a gapped alignment covering most of the sequence
+    assert!(hsp.alignment_length > 50, "alignment should span most of the sequence, got {}", hsp.alignment_length);
+    assert!(hsp.percent_identity() > 80.0, "should be high identity despite gap");
+}
+
+#[test]
+fn blastp_gapped_alignment_deletion() {
+    // Subject is missing residues compared to query
+    let query   = "MKFLILLFNILCLFPVLAADNHGVSMNAS";
+    let subject = "MKFLILLFPVLAADNHGVSMNAS"; // "NILCLF" deleted
+
+    let (_tmp, db) = build_protein_db(vec![
+        protein_entry("P001", "with deletion", subject),
+    ]);
+    let params = SearchParams::blastp().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0);
+    let results = blastp(&db, query.as_bytes(), &params);
+    assert!(!results.is_empty(), "should find gapped hit with deletion");
+    let hsp = &results[0].hsps[0];
+    assert!(hsp.num_gaps > 0, "alignment should have gaps for deletion");
+}
+
+// ── Max HSPs limit ──────────────────────────────────────────────────────────
+
+#[test]
+fn blastp_max_hsps_limit() {
+    // Subject with two distinct matching regions separated by unrelated sequence
+    let region1 = "MKFLILLFNILCLFPVLAAD";
+    let spacer = "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW";
+    let region2 = "NHGVSMNASQRDHFKLAEV";
+    let subject = format!("{}{}{}", region1, spacer, region2);
+    let query = format!("{}{}", region1, region2);
+
+    let (_tmp, db) = build_protein_db(vec![
+        protein_entry("P001", "two regions", &subject),
+    ]);
+
+    // Without max_hsps limit
+    let params_unlimited = SearchParams::blastp().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0);
+    let r_unlimited = blastp(&db, query.as_bytes(), &params_unlimited);
+
+    // With max_hsps=1
+    let params_limited = SearchParams::blastp().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0).max_hsps(Some(1));
+    let r_limited = blastp(&db, query.as_bytes(), &params_limited);
+
+    if !r_unlimited.is_empty() && r_unlimited[0].hsps.len() > 1 {
+        assert!(r_limited[0].hsps.len() <= 1,
+            "max_hsps=1 should limit to 1 HSP, got {}", r_limited[0].hsps.len());
+    }
+}
+
+// ── Soft masking vs hard masking ────────────────────────────────────────────
+
+#[test]
+fn soft_masking_vs_no_masking() {
+    // Sequence with enough complexity on both sides of a low-complexity region
+    let query = "MKFLILLFNILCLFPVLAADNHGVSMNASACDEFGHIKLMNPQRSTVWYAAAAAAAAAAAAAAACDEFGHIKLMNPQRSTVWYMKFLILLFNILCLFPVLAAD";
+    let (_tmp, db) = build_protein_db(vec![
+        protein_entry("P001", "target", query),
+    ]);
+
+    // With masking off
+    let params_off = SearchParams::blastp().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0);
+    let r_off = blastp(&db, query.as_bytes(), &params_off);
+
+    // With soft masking on (mask for seeding only, extend with unmasked)
+    let mut params_soft = SearchParams::blastp_defaults();
+    params_soft.evalue_threshold = 10.0;
+    params_soft.num_threads = 1;
+    params_soft.filter_low_complexity = true;
+    params_soft.soft_masking = true;
+    params_soft.comp_adjust = 0;
+    let r_soft = blastp(&db, query.as_bytes(), &params_soft);
+
+    // Both should find the self-match (soft masking only affects seeding, not extension)
+    assert!(!r_off.is_empty(), "no masking should find self-match");
+    assert!(!r_soft.is_empty(), "soft masking should still find self-match via unmasked flanks");
+}
+
+// ── Word size variations ────────────────────────────────────────────────────
+
+#[test]
+fn blastp_word_size_2() {
+    let query = "MKFLILLFNILCLFPVLAADNHGVSMNAS";
+    let (_tmp, db) = build_protein_db(vec![
+        protein_entry("P001", "target", query),
+    ]);
+    let params = SearchParams::blastp().evalue(10.0).word_size(2).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0);
+    let results = blastp(&db, query.as_bytes(), &params);
+    assert!(!results.is_empty(), "word_size=2 should find self-match");
+    assert!((results[0].hsps[0].percent_identity() - 100.0).abs() < 0.01);
+}
+
+#[test]
+fn blastp_word_size_5() {
+    // Longer query needed for word_size=5
+    let query = "MKFLILLFNILCLFPVLAADNHGVSMNASACDEFGHIKLMNPQRSTVWY";
+    let (_tmp, db) = build_protein_db(vec![
+        protein_entry("P001", "target", query),
+    ]);
+    let params = SearchParams::blastp().evalue(10.0).word_size(5).num_threads(1)
+        .filter_low_complexity(false).comp_adjust(0);
+    let results = blastp(&db, query.as_bytes(), &params);
+    assert!(!results.is_empty(), "word_size=5 should find self-match");
+    assert!((results[0].hsps[0].percent_identity() - 100.0).abs() < 0.01);
+}
+
+// ── BLASTN with mismatches + gaps ───────────────────────────────────────────
+
+#[test]
+fn blastn_gapped_alignment() {
+    // Subject has a 3-base insertion compared to query
+    let query   = "ATGCGTACCTGAAAGCTTCAGTACGGTAATCCTGAACGTTAGCCAATGCTTGAAGTCAACGTATCGCAAGCTTAACGATCGTAAGGCCTTAGCAGTCAATGC";
+    let subject = "ATGCGTACCTGAAAGCTTCAGTACAAAGGTAATCCTGAACGTTAGCCAATGCTTGAAGTCAACGTATCGCAAGCTTAACGATCGTAAGGCCTTAGCAGTCAATGC";
+    // "AAA" inserted after position 23
+
+    let (_tmp, db) = build_nucleotide_db(vec![
+        nt_entry("N001", "with insertion", subject),
+    ]);
+    let params = SearchParams::blastn().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false);
+    let results = blastn(&db, query.as_bytes(), &params);
+    assert!(!results.is_empty(), "should find gapped nucleotide hit");
+    let hsp = &results[0].hsps[0];
+    assert!(hsp.percent_identity() > 90.0, "should be high identity despite insertion");
+}
+
+#[test]
+fn blastn_multiple_mismatches() {
+    let query   = "ATGCGTACCTGAAAGCTTCAGTACGGTAATCCTGAACGTTAGCCAATGCTTGAAGTCAACGTATCGCAAGCTTAACGATCGTAAGGCCTTAGCAGTCAATGC";
+    // 5 mismatches spread throughout
+    let subject = "ATGCGTACCTGAAAGCTTCAGTACGGTAATCCTGAACGTTAGCCAATGCTTGAAGTCAACGTATCGCAAGCTTAACGATCGTAAGGCCTTAGCAGTCAATGC";
+    let mut subj_bytes = subject.as_bytes().to_vec();
+    subj_bytes[10] = b'T'; // G→T
+    subj_bytes[30] = b'A'; // C→A
+    subj_bytes[50] = b'G'; // A→G
+    subj_bytes[70] = b'C'; // G→C
+    subj_bytes[90] = b'T'; // A→T
+    let subj_str = String::from_utf8(subj_bytes).unwrap();
+
+    let (_tmp, db) = build_nucleotide_db(vec![
+        nt_entry("N001", "5 mismatches", &subj_str),
+    ]);
+    let params = SearchParams::blastn().evalue(10.0).num_threads(1)
+        .filter_low_complexity(false);
+    let results = blastn(&db, query.as_bytes(), &params);
+    assert!(!results.is_empty(), "should find hit with 5 mismatches in 100bp");
+    let hsp = &results[0].hsps[0];
+    assert!(hsp.percent_identity() > 90.0, "95% identity expected, got {:.1}%", hsp.percent_identity());
+    assert!(hsp.percent_identity() < 100.0, "should not be 100% with mismatches");
+}

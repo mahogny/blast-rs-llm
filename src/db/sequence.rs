@@ -198,8 +198,8 @@ pub fn get_protein_raw(psq: &[u8], start: usize, end: usize) -> &[u8] {
 }
 
 /// Decode nucleotide sequence for one OID.
-/// seq_range: [sequence_array[oid] .. ambig_array[oid]]
-/// ambig_range: [ambig_array[oid] .. sequence_array[oid+1]]
+/// seq_range: `sequence_array[oid] .. ambig_array[oid]`
+/// ambig_range: `ambig_array[oid] .. sequence_array[oid+1]`
 pub fn get_nucleotide(nsq: &[u8], seq_start: usize, seq_end: usize, ambig_start: usize, ambig_end: usize) -> Vec<u8> {
     let packed = if seq_start < seq_end && seq_end <= nsq.len() {
         &nsq[seq_start..seq_end]

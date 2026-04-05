@@ -41,7 +41,7 @@ impl FromStr for MatrixType {
 #[derive(Debug, Clone)]
 pub struct ScoringMatrix {
     pub name: MatrixType,
-    /// scores[a][b] = score for aligning residue a with residue b
+    /// `scores[a][b]` = score for aligning residue a with residue b
     pub scores: [[i32; 28]; 28],
     /// Lowest score (used for out-of-range residues)
     pub min_score: i32,

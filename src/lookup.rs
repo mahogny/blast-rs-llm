@@ -195,7 +195,7 @@ fn enumerate_rec_shift(
 /// Word size typically 11. Uses a flat array indexed by 2-bit packed word.
 pub struct NucleotideLookup {
     pub word_size: usize,
-    /// positions[word_code] = list of query positions
+    /// `positions[word_code]` = list of query positions
     pub table: Vec<Vec<u32>>,
     pub capacity: usize,
 }
@@ -352,7 +352,7 @@ pub struct DiscontiguousLookup {
     pub word_size: usize, // number of care positions
     /// Template mask: true = care position, false = don't care
     pub template: Vec<bool>,
-    /// table[code] = list of query positions
+    /// `table[code]` = list of query positions
     pub table: Vec<Vec<u32>>,
     pub capacity: usize,
 }

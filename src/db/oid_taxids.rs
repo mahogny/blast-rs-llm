@@ -2,7 +2,7 @@
 //!
 //! File layout (all integers little-endian):
 //!   [0..7]              Uint8   num_oids
-//!   [8..8+8*num_oids-1] Uint8[] end-offset array: end_offset[i] = offset in the data
+//!   `[8..8+8*num_oids-1]` end-offset array: `end_offset(i)` = offset in the data
 //!                                section (in units of i32, i.e. 4-byte elements)
 //!                                where OID i's tax-id data ends
 //!   [8+8*num_oids..]    i32[]   concatenated tax-id lists (little-endian i32)

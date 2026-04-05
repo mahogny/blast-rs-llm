@@ -2,7 +2,7 @@
 //!
 //! File layout (all integers little-endian):
 //!   [0..7]              Uint8   num_oids
-//!   [8..8+8*num_oids-1] Uint8[] end-offset array: end_offset[i] = byte offset in the data
+//!   `[8..8+8*num_oids-1]` end-offset array: `end_offset(i)` = byte offset in the data
 //!                                section where OID i's seq-id data ends
 //!   [8+8*num_oids..]    data    concatenated seq-id records for each OID
 //!
