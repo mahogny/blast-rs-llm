@@ -308,9 +308,11 @@ pub fn blast_search(
     }).collect();
 
     // Process each OID (parallelized with rayon)
-    // Thread-local scratch buffers avoid per-subject allocation
+    // Thread-local scratch buffers avoid per-subject allocation.
+    // Uses UnsafeCell instead of RefCell to eliminate borrow check overhead on every subject.
+    use std::cell::UnsafeCell;
     thread_local! {
-        static SCRATCH: RefCell<SearchScratch> = RefCell::new(SearchScratch::new());
+        static SCRATCH: UnsafeCell<SearchScratch> = UnsafeCell::new(SearchScratch::new());
     }
 
     let oids: Vec<u32> = (0..db.num_sequences()).collect();
@@ -323,13 +325,14 @@ pub fn blast_search(
         if subject.len() < lookup.word_size { return None; }
 
         let mut hsps = SCRATCH.with(|scratch| {
-            let mut scratch = scratch.borrow_mut();
+            // Safety: each Rayon thread has its own thread-local; no concurrent access.
+            let scratch = unsafe { &mut *scratch.get() };
             if scratch.diag_mask == 0 {
                 scratch.init_diags(query_for_extend.len());
             }
             search_one_protein_scratch(
                 query_for_extend, subject, &lookup, &matrix, &ka, params,
-                eff_query_len, eff_db_len, &score_profile, &score_profile_i8, &mut scratch,
+                eff_query_len, eff_db_len, &score_profile, &score_profile_i8, scratch,
                 effective_cutoff, capped_trigger,
             )
         });
@@ -483,8 +486,8 @@ fn search_one_protein_scratch(
     let diag_offset = scratch.diag_offset;
     let window = params.two_hit_window as i32;
     // NCBI-style shift-based rolling hash: (code << charsize | residue) & mask
-    let charsize = lookup.charsize;
-    let mask = lookup.mask;
+    let _charsize = lookup.charsize;
+    let _mask = lookup.mask;
 
     scratch.ungapped_hits.clear();
 
@@ -578,15 +581,12 @@ fn search_one_protein_scratch(
     hsps
 }
 
-/// Process hits for a single word code that passed the presence check.
-/// Separated from the scan loop to reduce instruction footprint of the fast path (no-hit).
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-unsafe fn process_two_hit_word(
+/// Context for two-hit scan processing — packed into a struct so the
+/// hit-processing function call uses only 6 register arguments (no stack spills at call site).
+#[repr(align(64))]
+struct TwoHitCtx {
     bb_ptr: *const crate::lookup::BackboneCell,
     ovfl_ptr: *const u32,
-    code: u32,
-    s_pos: usize,
     diag_offset: i32,
     diag_mask: usize,
     window: i32,
@@ -595,26 +595,65 @@ unsafe fn process_two_hit_word(
     prof_ptr: *const [i8; 32],
     x_drop: i32,
     cutoff: i32,
-    query: &[u8],
-    subject: &[u8],
-    ungapped_hits: &mut Vec<(i32, usize, usize, usize, usize)>,
+}
+
+/// Extended context that also holds query/subject pointers + ungapped_hits.
+/// This allows the hit-processing function to take JUST 3 arguments (ctx, code, s_pos).
+struct TwoHitCtxFull {
+    inner: TwoHitCtx,
+    query_ptr: *const u8,
+    query_len: usize,
+    subject_ptr: *const u8,
+    subject_len: usize,
+    ungapped_hits: *mut Vec<(i32, usize, usize, usize, usize)>,
+}
+
+/// Perform ungapped extension for a two-hit pair (rare path).
+#[inline(never)]
+unsafe fn do_ungapped_extend(
+    ctx: &TwoHitCtxFull,
+    q_pos: usize,
+    s_pos: usize,
+    s_with_offset: i32,
+    dc: *mut DiagEntry,
 ) {
-    let cell = &*bb_ptr.add(code as usize);
+    let hit = ungapped_extend_unsafe(
+        ctx.subject_ptr, ctx.query_len, ctx.subject_len, q_pos, s_pos,
+        ctx.inner.prof_ptr, ctx.inner.x_drop,
+    );
+    if hit.0 >= ctx.inner.cutoff {
+        (*ctx.ungapped_hits).push(hit);
+        *dc = DiagEntry::new(hit.4 as i32 + ctx.inner.diag_offset, true);
+    } else {
+        *dc = DiagEntry::new(s_with_offset, false);
+    }
+}
+
+/// Process hits for a word code (multi-hit path). Takes 3 args.
+#[inline(never)]
+unsafe fn process_two_hit_code(
+    ctx: &TwoHitCtxFull,
+    code: u32,
+    s_pos: usize,
+) {
+    let cell = &*ctx.inner.bb_ptr.add(code as usize);
     let n = cell.num_used as usize;
 
+    // All hits (inline and overflow) stored in overflow array for generic path
     let (hits_ptr, hits_len) = if n <= 1 {
         (&cell.data as *const u32, n)
     } else {
-        (ovfl_ptr.add(cell.data as usize), n)
+        (ctx.inner.ovfl_ptr.add(cell.data as usize), n)
     };
+    let hits_len = n;
 
     let s_off_i32 = s_pos as i32;
-    let s_with_offset = s_off_i32 + diag_offset;
+    let s_with_offset = s_off_i32 + ctx.inner.diag_offset;
 
     for h in 0..hits_len {
         let q_pos = *hits_ptr.add(h) as usize;
-        let diag_coord = q_pos.wrapping_sub(s_pos) & diag_mask;
-        let dc = diag_arr.add(diag_coord);
+        let diag_coord = q_pos.wrapping_sub(s_pos) & ctx.inner.diag_mask;
+        let dc = ctx.inner.diag_arr.add(diag_coord);
         let entry = *dc;
 
         if entry.flag() {
@@ -623,29 +662,29 @@ unsafe fn process_two_hit_word(
             continue;
         }
 
-        let diff = s_off_i32 - (entry.last_hit() - diag_offset);
+        let diff = s_off_i32 - (entry.last_hit() - ctx.inner.diag_offset);
 
-        if (diff as u32) >= (window as u32) {
+        if (diff as u32) >= (ctx.inner.window as u32) {
             *dc = DiagEntry::new(s_with_offset, false);
             continue;
         }
 
-        if diff < ws_i32 { continue; }
+        if diff < ctx.inner.ws_i32 { continue; }
 
         let hit = ungapped_extend_unsafe(
-            query, subject, q_pos, s_pos, prof_ptr, x_drop,
+            ctx.subject_ptr, ctx.query_len, ctx.subject_len,
+            q_pos, s_pos, ctx.inner.prof_ptr, ctx.inner.x_drop,
         );
-        if hit.0 >= cutoff {
-            ungapped_hits.push(hit);
-            *dc = DiagEntry::new(hit.4 as i32 + diag_offset, true);
+        if hit.0 >= ctx.inner.cutoff {
+            (*ctx.ungapped_hits).push(hit);
+            *dc = DiagEntry::new(hit.4 as i32 + ctx.inner.diag_offset, true);
         } else {
             *dc = DiagEntry::new(s_with_offset, false);
         }
     }
 }
 
-/// Two-hit scanning with interleaved scan+process.
-/// Parameter count minimized to reduce register pressure (fewer stack spills).
+/// Two-hit scanning. Dispatches to word-size-3 specialized version when possible.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn scan_two_hit(
@@ -661,20 +700,66 @@ fn scan_two_hit(
     ungapped_hits: &mut Vec<(i32, usize, usize, usize, usize)>,
     query: &[u8],
 ) {
+    // Dispatch to specialized versions with compile-time constants for ws/charsize/mask.
+    // Constants become immediate operands, freeing 3 register slots.
+    match lookup.word_size {
+        2 => scan_two_hit_inner::<5, 0x3FF, 2>(
+            subject, lookup, score_profile, x_drop, cutoff,
+            diag_mask, diag_offset, window, diag_array, ungapped_hits, query),
+        3 => scan_two_hit_inner::<5, 0x7FFF, 3>(
+            subject, lookup, score_profile, x_drop, cutoff,
+            diag_mask, diag_offset, window, diag_array, ungapped_hits, query),
+        5 => scan_two_hit_inner::<5, 0x1FFFFFF, 5>(
+            subject, lookup, score_profile, x_drop, cutoff,
+            diag_mask, diag_offset, window, diag_array, ungapped_hits, query),
+        _ => {
+            // Generic fallback for unusual word sizes
+            let ws = lookup.word_size;
+            let charsize = lookup.charsize;
+            let mask = lookup.mask;
+            scan_two_hit_generic(
+                subject, lookup, score_profile, x_drop, cutoff,
+                diag_mask, diag_offset, window, diag_array, ungapped_hits, query,
+                ws, charsize, mask,
+            );
+        }
+    }
+}
+
+/// Generic fallback for non-standard word sizes.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn scan_two_hit_generic(
+    subject: &[u8],
+    lookup: &crate::lookup::ProteinLookup,
+    score_profile: &[[i8; 32]],
+    x_drop: i32,
+    cutoff: i32,
+    diag_mask: usize,
+    diag_offset: i32,
+    window: i32,
+    diag_array: &mut [DiagEntry],
+    ungapped_hits: &mut Vec<(i32, usize, usize, usize, usize)>,
+    query: &[u8],
+    ws: usize,
+    charsize: u32,
+    mask: u32,
+) {
     let slen = subject.len();
-    let ws = lookup.word_size;
-    let charsize = lookup.charsize;
-    let mask = lookup.mask;
+    if slen < ws { return; }
     let num_words = slen - ws + 1;
-    let ws_i32 = ws as i32;
 
     unsafe {
         let subj_ptr = subject.as_ptr();
-        let diag_arr = diag_array.as_mut_ptr();
         let pv_ptr = lookup.presence.as_ptr();
-        let bb_ptr = lookup.backbone.as_ptr();
-        let ovfl_ptr = lookup.overflow.as_ptr();
-        let prof_ptr = score_profile.as_ptr();
+        let ctx = TwoHitCtx {
+            bb_ptr: lookup.backbone.as_ptr(),
+            ovfl_ptr: lookup.overflow.as_ptr(),
+            diag_offset, diag_mask, window, ws_i32: ws as i32,
+            diag_arr: diag_array.as_mut_ptr(),
+            prof_ptr: score_profile.as_ptr(),
+            x_drop, cutoff,
+        };
 
         let mut code = 0u32;
         for i in 0..ws {
@@ -685,15 +770,145 @@ fn scan_two_hit(
         loop {
             let pv_word = *pv_ptr.add((code as usize) >> 6);
             if pv_word & (1u64 << (code & 63)) != 0 {
-                process_two_hit_word(
-                    bb_ptr, ovfl_ptr, code, s_pos, diag_offset, diag_mask, window, ws_i32,
-                    diag_arr, prof_ptr, x_drop, cutoff, query, subject, ungapped_hits,
-                );
+                let cell = &*ctx.bb_ptr.add(code as usize);
+                let n = cell.num_used as usize;
+                let (hits_ptr, hits_len) = if n <= 1 {
+                    (&cell.data as *const u32, n)
+                } else {
+                    (ctx.ovfl_ptr.add(cell.data as usize), n)
+                };
+                let s_off_i32 = s_pos as i32;
+                let s_with_offset = s_off_i32 + ctx.diag_offset;
+                for h in 0..hits_len {
+                    let q_pos = *hits_ptr.add(h) as usize;
+                    let diag_coord = q_pos.wrapping_sub(s_pos) & ctx.diag_mask;
+                    let dc = ctx.diag_arr.add(diag_coord);
+                    let entry = *dc;
+                    if entry.flag() {
+                        if s_with_offset < entry.last_hit() { continue; }
+                        *dc = DiagEntry::new(s_with_offset, false);
+                        continue;
+                    }
+                    let diff = s_off_i32 - (entry.last_hit() - ctx.diag_offset);
+                    if (diff as u32) >= (ctx.window as u32) {
+                        *dc = DiagEntry::new(s_with_offset, false);
+                        continue;
+                    }
+                    if diff < ctx.ws_i32 { continue; }
+                    let hit = ungapped_extend_unsafe(subject.as_ptr(), query.len(), subject.len(), q_pos, s_pos, ctx.prof_ptr, ctx.x_drop);
+                    if hit.0 >= ctx.cutoff {
+                        ungapped_hits.push(hit);
+                        *dc = DiagEntry::new(hit.4 as i32 + ctx.diag_offset, true);
+                    } else {
+                        *dc = DiagEntry::new(s_with_offset, false);
+                    }
+                }
             }
-
             s_pos += 1;
             if s_pos >= num_words { break; }
             code = ((code << charsize) | (*subj_ptr.add(s_pos + ws - 1) as u32 & 0x1F)) & mask;
+        }
+    }
+}
+
+/// Generic two-hit scan with compile-time constants for charsize, mask, ws.
+/// The constants become immediate operands, eliminating 3 register-resident variables.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn scan_two_hit_inner<const CHARSIZE: u32, const MASK: u32, const WS: usize>(
+    subject: &[u8],
+    lookup: &crate::lookup::ProteinLookup,
+    score_profile: &[[i8; 32]],
+    x_drop: i32,
+    cutoff: i32,
+    diag_mask: usize,
+    diag_offset: i32,
+    window: i32,
+    diag_array: &mut [DiagEntry],
+    ungapped_hits: &mut Vec<(i32, usize, usize, usize, usize)>,
+    query: &[u8],
+) {
+    let slen = subject.len();
+    if slen < WS { return; }
+    let num_words = slen - WS + 1;
+
+    unsafe {
+        let subj_ptr = subject.as_ptr();
+        let pv_ptr = lookup.presence.as_ptr();
+
+        let ctx = TwoHitCtxFull {
+            inner: TwoHitCtx {
+                bb_ptr: lookup.backbone.as_ptr(),
+                ovfl_ptr: lookup.overflow.as_ptr(),
+                diag_offset, diag_mask, window, ws_i32: WS as i32,
+                diag_arr: diag_array.as_mut_ptr(),
+                prof_ptr: score_profile.as_ptr(),
+                x_drop, cutoff,
+            },
+            query_ptr: query.as_ptr(),
+            query_len: query.len(),
+            subject_ptr: subject.as_ptr(),
+            subject_len: subject.len(),
+            ungapped_hits: ungapped_hits as *mut _,
+        };
+
+        let diag_arr = ctx.inner.diag_arr;
+        let diag_off = ctx.inner.diag_offset;
+        let diag_msk = ctx.inner.diag_mask;
+        let win = ctx.inner.window;
+
+        let mut code = 0u32;
+        for i in 0..WS {
+            code = (code << CHARSIZE) | (*subj_ptr.add(i) as u32 & 0x1F);
+        }
+
+        let mut s_pos = 0usize;
+        loop {
+            let pv_word = *pv_ptr.add((code as usize) >> 6);
+            if pv_word & (1u64 << (code & 63)) != 0 {
+
+            let cell = &*lookup.backbone.get_unchecked(code as usize);
+            let n = cell.num_used as usize;
+
+            let (hits_ptr, hits_len) = if n <= 1 {
+                (&cell.data as *const u32, n)
+            } else {
+                (lookup.overflow.as_ptr().add(cell.data as usize), n)
+            };
+
+            let s_off_i32 = s_pos as i32;
+            let s_with_offset = s_off_i32 + diag_off;
+
+            for h in 0..hits_len {
+                let q_pos = *hits_ptr.add(h) as usize;
+                let diag_coord = q_pos.wrapping_sub(s_pos) & diag_msk;
+                let dc = diag_arr.add(diag_coord);
+                let entry = *dc;
+
+                if entry.flag() {
+                    if s_with_offset >= entry.last_hit() {
+                        *dc = DiagEntry::new(s_with_offset, false);
+                    }
+                    continue;
+                }
+
+                let diff = s_off_i32 - (entry.last_hit() - diag_off);
+
+                if (diff as u32) >= (win as u32) {
+                    *dc = DiagEntry::new(s_with_offset, false);
+                    continue;
+                }
+
+                if diff < WS as i32 { continue; }
+
+                do_ungapped_extend(&ctx, q_pos, s_pos, s_with_offset, dc);
+            }
+
+            } // pv check
+
+            s_pos += 1;
+            if s_pos >= num_words { break; }
+            code = ((code << CHARSIZE) | (*subj_ptr.add(s_pos + WS - 1) as u32 & 0x1F)) & MASK;
         }
     }
 }
@@ -757,7 +972,7 @@ fn scan_one_hit(
                 if entry.flag() && s_with_offset < entry.last_hit() { continue; }
 
                 let hit = ungapped_extend_unsafe(
-                    query, subject, q_pos, s_pos, prof_ptr, x_drop,
+                    subject.as_ptr(), query.len(), subject.len(), q_pos, s_pos, prof_ptr, x_drop,
                 );
                 if hit.0 >= cutoff {
                     *diag_arr.add(diag_coord) = DiagEntry::new(hit.4 as i32 + diag_offset, true);
@@ -778,12 +993,9 @@ fn scan_one_hit(
 /// All bounds are pre-validated by the caller; inner loops use pure pointer arithmetic.
 #[inline(always)]
 unsafe fn ungapped_extend_unsafe(
-    query: &[u8], subject: &[u8], q_pos: usize, s_pos: usize,
+    s_ptr: *const u8, qlen: usize, slen: usize, q_pos: usize, s_pos: usize,
     prof_ptr: *const [i8; 32], x_drop: i32,
 ) -> (i32, usize, usize, usize, usize) {
-    let qlen = query.len();
-    let slen = subject.len();
-    let s_ptr = subject.as_ptr();
 
     // Word scan: find best start within word_size=3 positions
     let ws = 3usize;
@@ -794,7 +1006,7 @@ unsafe fn ungapped_extend_unsafe(
     let mut q_scan = prof_ptr.add(q_pos);
     let mut s_scan = s_ptr.add(s_pos);
     for i in 0..scan_end {
-        scan_score += (*q_scan)[*s_scan as usize] as i32;
+        scan_score += *(*q_scan).get_unchecked(*s_scan as usize) as i32;
         q_scan = q_scan.add(1);
         s_scan = s_scan.add(1);
         if scan_score > best_scan {
@@ -816,7 +1028,7 @@ unsafe fn ungapped_extend_unsafe(
     for i in 1..=n_left {
         q_left = q_left.sub(1);
         s_left = s_left.sub(1);
-        score += (*q_left)[*s_left as usize] as i32;
+        score += *(*q_left).get_unchecked(*s_left as usize) as i32;
         if score > maxscore {
             maxscore = score;
             best_left = i;
@@ -833,7 +1045,7 @@ unsafe fn ungapped_extend_unsafe(
     let mut q_right = prof_ptr.add(eq);
     let mut s_right = s_ptr.add(es);
     for i in 0..n_right {
-        score += (*q_right)[*s_right as usize] as i32;
+        score += *(*q_right).get_unchecked(*s_right as usize) as i32;
         q_right = q_right.add(1);
         s_right = s_right.add(1);
         if score > maxscore {
@@ -926,7 +1138,6 @@ fn ungapped_extend_inline(
     (left_score + best, best_q_start, best_q_end, best_s_start, best_s_end)
 }
 
-/// Optimized protein search for one subject (legacy, used by search_one_protein_fast).
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 fn search_one_protein_fast(

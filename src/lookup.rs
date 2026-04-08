@@ -3,15 +3,13 @@
 use crate::matrix::ScoringMatrix;
 
 /// Compact backbone cell: 8 bytes (u32 count + u32 data).
-/// Total backbone = 256KB (fits L2) vs 512KB with 16-byte cells.
-/// For 1 hit (most common case): data = query position (inline).
+/// Total backbone = 256KB (fits L2).
+/// For 1 hit (most common): data = query position (inline, no pointer chase).
 /// For >1 hits: data = offset into overflow array.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BackboneCell {
-    /// Number of hits: 0 = empty, 1 = inline, >1 = overflow
     pub num_used: u32,
-    /// For num_used=1: the query position. For num_used>1: overflow array offset.
     pub data: u32,
 }
 
@@ -30,6 +28,7 @@ pub struct ProteinLookup {
     pub presence: Vec<u64>,
     /// Backbone: one cell per possible word code.
     pub backbone: Vec<BackboneCell>,
+    /// Overflow array for words with >1 hits
     pub overflow: Vec<u32>,
     #[allow(dead_code)]
     capacity: usize,
@@ -46,7 +45,7 @@ pub fn encode_protein_word(residues: &[u8]) -> u32 {
     code
 }
 
-/// Max hits stored inline per backbone cell (1 = compact 8-byte cells)
+/// Max hits stored inline per backbone cell
 const HITS_PER_CELL: usize = 1;
 
 impl ProteinLookup {
@@ -126,6 +125,8 @@ impl ProteinLookup {
     /// Get hits for a word code. Inlined for the hot scanning loop.
     /// For 1 hit: returns pointer to inline data (same cache line).
     /// For >1 hits: returns slice into overflow array.
+    #[inline(always)]
+    /// Get hits for a word code.
     #[inline(always)]
     pub fn get_hits(&self, code: u32) -> &[u32] {
         let code = code as usize;

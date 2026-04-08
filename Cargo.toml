@@ -10,6 +10,13 @@ keywords = ["bioinformatics", "blast", "alignment", "sequence", "genomics"]
 categories = ["science", "command-line-utilities"]
 readme = "README.md"
 rust-version = "1.82"
+exclude = [
+    "ncbi-blast-2.17.0+-src/",
+    "bench/results/",
+    "bench/tmp/",
+    "target/",
+    ".cargo/",
+]
 
 [[bin]]
 name = "blast-cli"
